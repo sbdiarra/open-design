@@ -3,28 +3,35 @@ name: open-design
 services:
   open-design:
     container_name: open-design
-    image: ${OPEN_DESIGN_IMAGE:-docker.io/vanjayak/open-design:latest}
+    image: ${OPEN_DESIGN_IMAGE:-open-design:local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      args:
+        INSTALL_KILO_CLI: ${INSTALL_KILO_CLI:-true}
     restart: always
     environment:
+      HOME: /app/.od/home
       NODE_ENV: production
       NODE_OPTIONS: ${NODE_OPTIONS:---max-old-space-size=192}
       OD_BIND_HOST: 0.0.0.0
+      # OD_API_TOKEN: ${OPEN_DESIGN_API_TOKEN}
       OD_ALLOWED_ORIGINS: ${OPEN_DESIGN_ALLOWED_ORIGINS:-}
+      OD_DATA_DIR: /app/.od
       OD_PORT: 7456
       OD_WEB_PORT: ${OPEN_DESIGN_PORT:-7456}
     ports:
       - "127.0.0.1:${OPEN_DESIGN_PORT:-7456}:7456"
     volumes:
       - open_design_data:/app/.od
-    read_only: true
+    read_only: ${OPEN_DESIGN_READ_ONLY:-false}
     tmpfs:
-      - /tmp
+      - /tmp:exec
     security_opt:
       - no-new-privileges:true
-    mem_limit: ${OPEN_DESIGN_MEM_LIMIT:-384m}
+    cap_drop:
+      - ALL
+    mem_limit: ${OPEN_DESIGN_MEM_LIMIT:-1g}
     pids_limit: 256
     healthcheck:
       test:
