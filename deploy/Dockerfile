@@ -74,7 +74,25 @@ FROM ${RUNTIME_IMAGE}
 
 ARG INSTALL_KILO_CLI=true
 
-RUN apk add --no-cache git tini poppler-utils && \
+RUN apk add --no-cache \
+    bash \
+    curl \
+    git \
+    openssl \
+    tini \
+    poppler-utils \
+    ffmpeg \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
+    ttf-freefont \
+    font-noto \
+    font-noto-cjk \
+    font-noto-emoji \
+    imagemagick \
+    librsvg \
+    rsvg-convert && \
     if [ "${INSTALL_KILO_CLI}" = "true" ]; then npm install -g @kilocode/cli; fi
 
 WORKDIR /app
@@ -110,6 +128,8 @@ ENV HOME=/app/.od/home
 ENV NODE_OPTIONS=--max-old-space-size=192
 ENV OD_BIND_HOST=0.0.0.0
 ENV OD_PORT=7456
+ENV CHROME_BIN=/usr/bin/chromium-browser
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 EXPOSE 7456
 
