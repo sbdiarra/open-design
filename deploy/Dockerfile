@@ -17,6 +17,10 @@ ENV https_proxy=${https_proxy}
 ENV no_proxy=${no_proxy}
 ENV NO_PROXY=${NO_PROXY}
 ENV CI=true
+# Coolify forwards runtime NODE_OPTIONS into build RUN steps. Keep the runtime
+# heap small, but override it while installing/building so TypeScript/esbuild
+# postinstall work does not OOM under --max-old-space-size=192.
+ENV OD_BUILD_NODE_OPTIONS=--max-old-space-size=1024
 
 RUN apk add --no-cache python3 make g++
 
@@ -30,12 +34,12 @@ COPY apps/web/package.json ./apps/web/package.json
 COPY e2e/package.json ./e2e/package.json
 RUN corepack enable && \
     corepack prepare pnpm@10.33.2 --activate && \
-    pnpm install --frozen-lockfile
+    NODE_OPTIONS=${OD_BUILD_NODE_OPTIONS} pnpm install --frozen-lockfile
 
 COPY apps ./apps
-RUN pnpm --filter @open-design/daemon build && \
-    pnpm --filter @open-design/web build && \
-    pnpm --filter @open-design/daemon deploy --legacy --prod /app/deploy/daemon && \
+RUN NODE_OPTIONS=${OD_BUILD_NODE_OPTIONS} pnpm --filter @open-design/daemon build && \
+    NODE_OPTIONS=${OD_BUILD_NODE_OPTIONS} pnpm --filter @open-design/web build && \
+    NODE_OPTIONS=${OD_BUILD_NODE_OPTIONS} pnpm --filter @open-design/daemon deploy --legacy --prod /app/deploy/daemon && \
     pnpm store prune && \
     rm -rf \
       /root/.cache \

@@ -22,6 +22,8 @@ services:
       OD_WEB_PORT: ${OPEN_DESIGN_PORT:-7456}
     ports:
       - "127.0.0.1:${OPEN_DESIGN_PORT:-7456}:7456"
+    labels:
+      - 'caddy_0.handle_path.0_reverse_proxy.header_up=Authorization "Bearer {env.OPEN_DESIGN_API_TOKEN}"'
     volumes:
       - open_design_data:/app/.od
     read_only: ${OPEN_DESIGN_READ_ONLY:-false}

@@ -17,7 +17,7 @@ Defaults:
 - Host app port: `127.0.0.1:7456` (`OPEN_DESIGN_PORT=8080` to publish on `127.0.0.1:8080`)
 - Runtime data volume: `open_design_data` mounted at `/app/.od`
 - Kilo CLI config/auth home: `/app/.od/home` (`HOME` is set there so config is writable and persistent)
-- Node heap cap: `--max-old-space-size=192`
+- Runtime Node heap cap: `--max-old-space-size=192` (the Docker build stage overrides this to avoid Coolify build-time OOMs)
 - Compose memory cap: `1g` (`OPEN_DESIGN_MEM_LIMIT=1536m` to raise for larger or concurrent Kilo runs)
 - Kilo CLI: installed during the Docker build by default (`INSTALL_KILO_CLI=false` to skip)
 - Root filesystem: writable by default (`OPEN_DESIGN_READ_ONLY=true` only after validating agent CLIs in your setup)
