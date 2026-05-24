@@ -23,7 +23,9 @@ services:
     ports:
       - "127.0.0.1:${OPEN_DESIGN_PORT:-7456}:7456"
     labels:
-      - 'caddy_0.handle_path.0_reverse_proxy.header_up=Authorization "Bearer ${OPEN_DESIGN_API_TOKEN}"'
+      - 'caddy_0.handle_path.0_reverse_proxy.0_header_up=Authorization "Bearer ${OPEN_DESIGN_API_TOKEN}"'
+      - 'caddy_0.handle_path.0_reverse_proxy.1_header_up=Host {host}'
+      - 'caddy_0.handle_path.0_reverse_proxy.2_header_up=Origin "${OPEN_DESIGN_PUBLIC_ORIGIN:-http://localhost:7456}"'
     volumes:
       - open_design_data:/app/.od
     read_only: ${OPEN_DESIGN_READ_ONLY:-false}
