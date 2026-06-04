@@ -104,7 +104,7 @@ RUN apk add --no-cache \
     imagemagick \
     librsvg \
     rsvg-convert && \
-    if [ "${INSTALL_KILO_CLI}" = "true" ]; then npm install -g @kilocode/cli; fi
+    if [ "${INSTALL_KILO_CLI}" = "true" ]; then npm install -g @kilocode/cli@7.3.1; fi
 
 WORKDIR /app
 
