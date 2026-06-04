@@ -1,65 +1,11 @@
 import { expect, test } from '@playwright/test';
 import type { Locator, Page, Response } from '@playwright/test';
+import { applyStandardMocks } from '@/playwright/mock-factory';
 
-const STORAGE_KEY = 'open-design:config';
 const CHAT_PANEL_WIDTH_STORAGE_KEY = 'open-design.project.chatPanelWidth';
 
 test.beforeEach(async ({ page }) => {
-  await page.addInitScript((key) => {
-    window.localStorage.setItem(
-      key,
-      JSON.stringify({
-        mode: 'daemon',
-        apiKey: '',
-        baseUrl: 'https://api.anthropic.com',
-        model: 'claude-sonnet-4-5',
-        agentId: 'mock',
-        skillId: null,
-        designSystemId: null,
-        onboardingCompleted: true,
-        agentModels: {},
-        privacyDecisionAt: 1,
-        telemetry: { metrics: false, content: false, artifactManifest: false },
-      }),
-    );
-  }, STORAGE_KEY);
-
-  await page.route('**/api/agents', async (route) => {
-    await route.fulfill({
-      json: {
-        agents: [
-          {
-            id: 'mock',
-            name: 'Mock Agent',
-            bin: 'mock-agent',
-            available: true,
-            version: 'test',
-            models: [{ id: 'default', label: 'Default' }],
-          },
-        ],
-      },
-    });
-  });
-
-  await page.route('**/api/app-config', async (route) => {
-    if (route.request().method() !== 'GET') {
-      await route.continue();
-      return;
-    }
-    await route.fulfill({
-      json: {
-        config: {
-          onboardingCompleted: true,
-          agentId: 'mock',
-          skillId: null,
-          designSystemId: null,
-          agentModels: {},
-          privacyDecisionAt: 1,
-          telemetry: { metrics: false, content: false, artifactManifest: false },
-        },
-      },
-    });
-  });
+  await applyStandardMocks(page);
 });
 
 test('quick switcher opens from keyboard and activates the selected file', async ({ page }) => {
@@ -188,6 +134,69 @@ test('keyboard chat panel resize persists after reload', async ({ page }) => {
   await expectWorkspaceReady(page);
   const restoredWidth = await readChatPanelWidth(handle);
   expect(restoredWidth).toBe(resizedWidth);
+});
+
+test('project chat Enter sends while Shift+Enter inserts a newline', async ({ page }) => {
+  let runCount = 0;
+  await page.route('**/api/runs', async (route) => {
+    runCount += 1;
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ runId: `keyboard-run-${runCount}` }),
+    });
+  });
+  await page.route('**/api/runs/*/events', async (route) => {
+    const body = [
+      'event: start',
+      'data: {"bin":"mock-agent"}',
+      '',
+      'event: stdout',
+      `data: ${JSON.stringify({
+        chunk:
+          '<artifact identifier="keyboard-artifact" type="text/html" title="Keyboard Artifact"><!doctype html><html><body><main><h1>Keyboard Artifact</h1></main></body></html></artifact>',
+      })}`,
+      '',
+      'event: end',
+      'data: {"code":0,"status":"succeeded"}',
+      '',
+      '',
+    ].join('\n');
+    await route.fulfill({
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+      },
+      body,
+    });
+  });
+
+  await gotoEntryHome(page);
+  await createProject(page, 'Project chat keyboard send');
+  await expectWorkspaceReady(page);
+
+  const input = page.getByTestId('chat-composer-input');
+  await input.click();
+  await input.fill('first line');
+  await input.press('Shift+Enter');
+  await input.pressSequentially('second line');
+  await expect(input).toHaveValue('first line\nsecond line');
+  expect(runCount).toBe(0);
+
+  await Promise.all([
+    page.waitForResponse(isCreateRunResponse, { timeout: 5_000 }),
+    input.press('Enter'),
+  ]);
+
+  expect(runCount).toBe(1);
+  await expect(input).toHaveValue('');
+  await expect(page.locator('.msg.user', { hasText: 'first line' })).toHaveCount(1);
+  await expect(page.locator('.msg.user', { hasText: 'second line' })).toHaveCount(1);
+  await expect(page.getByRole('tab', { name: /keyboard-artifact\.html/i })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
 });
 
 test('quick switcher still activates another file after the project reloads', async ({ page }) => {
@@ -379,7 +388,7 @@ async function gotoEntryHome(page: Page) {
   await page.goto('/', { waitUntil: 'domcontentloaded' });
   await page.getByText('Loading Open Design…').waitFor({ state: 'detached', timeout: 10_000 }).catch(() => {});
   const privacyDialog = page.getByRole('dialog').filter({ hasText: 'Help us improve Open Design' });
-  if (await privacyDialog.isVisible().catch(() => false)) {
+  if (await privacyDialog.isVisible()) {
     await privacyDialog.getByRole('button', { name: /not now/i }).click();
     await expect(privacyDialog).toHaveCount(0);
   }
@@ -459,39 +468,16 @@ async function openQuickSwitcher(page: Page) {
   await expect(quickSwitcher).toBeVisible();
 }
 
-async function sendPrompt(
-  page: Page,
-  prompt: string,
-) {
+async function sendPrompt(page: Page, prompt: string) {
   const input = page.getByTestId('chat-composer-input');
   const sendButton = page.getByTestId('chat-send');
-  for (let attempt = 0; attempt < 3; attempt++) {
-    await input.click();
-    await input.fill(prompt);
-    try {
-      await expect(input).toHaveValue(prompt, { timeout: 1500 });
-      await expect(sendButton).toBeEnabled({ timeout: 1500 });
-      const chatResponse = page.waitForResponse(isCreateRunResponse, { timeout: 2000 });
-      await sendButton.evaluate((button: HTMLButtonElement) => button.click());
-      await chatResponse;
-      return;
-    } catch (error) {
-      await input.click();
-      await input.press(`${process.platform === 'darwin' ? 'Meta' : 'Control'}+A`);
-      await input.press('Backspace');
-      await input.pressSequentially(prompt);
-      try {
-        await expect(input).toHaveValue(prompt, { timeout: 1500 });
-        await expect(sendButton).toBeEnabled({ timeout: 1500 });
-        const chatResponse = page.waitForResponse(isCreateRunResponse, { timeout: 2000 });
-        await sendButton.evaluate((button: HTMLButtonElement) => button.click());
-        await chatResponse;
-        return;
-      } catch (retryError) {
-        if (attempt === 2) throw retryError;
-      }
-    }
-  }
+  await input.click();
+  await input.fill(prompt);
+  await expect(input).toHaveValue(prompt, { timeout: 1500 });
+  await expect(sendButton).toBeEnabled({ timeout: 1500 });
+  const chatResponse = page.waitForResponse(isCreateRunResponse, { timeout: 2000 });
+  await sendButton.evaluate((button: HTMLButtonElement) => button.click());
+  await chatResponse;
 }
 
 function tabBySuffix(page: Page, name: string): Locator {

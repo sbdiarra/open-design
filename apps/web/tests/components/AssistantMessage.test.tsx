@@ -13,7 +13,6 @@ import { AssistantMessage } from '../../src/components/AssistantMessage';
 import type { ChatMessage, ProjectFile } from '../../src/types';
 
 beforeAll(() => {
-  if (window.localStorage) return;
   const store = new Map<string, string>();
   Object.defineProperty(window, 'localStorage', {
     configurable: true,
@@ -192,6 +191,85 @@ describe('AssistantMessage status badge updates (Bug A)', () => {
     const matches = screen.queryAllByText('claude-opus-4-7-max');
     expect(matches.length).toBe(1);
   });
+
+  it('renders bare URLs in status details as links', () => {
+    render(
+      <AssistantMessage
+        message={baseMessage({
+          runStatus: 'failed',
+          events: [
+            {
+              kind: 'status',
+              label: 'error',
+              detail:
+                'AMR Cloud reported insufficient balance. Recharge at https://open-design.ai/amr/wallet, then retry.',
+            } as ChatMessage['events'][number],
+          ],
+        })}
+        streaming={false}
+        projectId="proj-1"
+        onFeedback={vi.fn()}
+      />,
+    );
+
+    const link = screen.getByRole('link', { name: 'https://open-design.ai/amr/wallet' });
+    expect(link.getAttribute('href')).toBe('https://open-design.ai/amr/wallet');
+    expect(link.classList.contains('md-link')).toBe(true);
+  });
+});
+
+describe('AssistantMessage question forms', () => {
+  it('renders only the first question form for a repeated form id in one assistant turn', () => {
+    const firstForm = [
+      '<question-form id="discovery" title="Quick brief — tailored">',
+      JSON.stringify({
+        questions: [
+          {
+            id: 'audience',
+            label: 'Who is this for?',
+            type: 'text',
+          },
+        ],
+      }),
+      '</question-form>',
+    ].join('\n');
+    const duplicateForm = [
+      '<question-form id="discovery" title="Quick brief — 30 seconds">',
+      JSON.stringify({
+        questions: [
+          {
+            id: 'output',
+            label: 'What are we making?',
+            type: 'radio',
+            required: true,
+            options: ['Slide deck / pitch', 'Dashboard / tool UI'],
+          },
+        ],
+      }),
+      '</question-form>',
+    ].join('\n');
+
+    render(
+      <AssistantMessage
+        message={baseMessage({
+          events: [
+            {
+              kind: 'text',
+              text: `${firstForm}\n\nFirst answer the tailored brief:\n\n${duplicateForm}`,
+            } as ChatMessage['events'][number],
+          ],
+        })}
+        streaming={false}
+        projectId="proj-1"
+        isLast
+      />,
+    );
+
+    expect(screen.getByText('Quick brief — tailored')).toBeTruthy();
+    expect(screen.getByText('Who is this for?')).toBeTruthy();
+    expect(screen.queryByText('Quick brief — 30 seconds')).toBeNull();
+    expect(screen.queryByText('What are we making?')).toBeNull();
+  });
 });
 
 describe('AssistantMessage recovered produced files', () => {
@@ -222,5 +300,95 @@ describe('AssistantMessage recovered produced files', () => {
     );
 
     expect(screen.getByText('iphone-device-reveal.mp4')).toBeTruthy();
+  });
+
+  it('does not infer user sketches as turn output files', () => {
+    render(
+      <AssistantMessage
+        message={baseMessage({
+          content: '',
+          events: [
+            { kind: 'status', label: 'starting', detail: 'Claude' } as ChatMessage['events'][number],
+            { kind: 'status', label: 'initializing', detail: 'claude-opus' } as ChatMessage['events'][number],
+          ],
+          producedFiles: [],
+        })}
+        streaming={false}
+        projectId="proj-1"
+        projectFiles={[
+          {
+            name: 'board.sketch.json',
+            path: 'board.sketch.json',
+            size: 2048,
+            mtime: 1700000004,
+            kind: 'sketch',
+            mime: 'application/json',
+          } as ProjectFile,
+        ]}
+      />,
+    );
+
+    expect(screen.queryByText('board.sketch.json')).toBeNull();
+  });
+
+  it('still infers generated svg files classified as sketches', () => {
+    render(
+      <AssistantMessage
+        message={baseMessage({
+          content: '',
+          events: [
+            { kind: 'status', label: 'starting', detail: 'Claude' } as ChatMessage['events'][number],
+            { kind: 'status', label: 'initializing', detail: 'claude-opus' } as ChatMessage['events'][number],
+          ],
+          producedFiles: [],
+        })}
+        streaming={false}
+        projectId="proj-1"
+        projectFiles={[
+          {
+            name: 'diagram.svg',
+            path: 'diagram.svg',
+            size: 2048,
+            mtime: 1700000004,
+            kind: 'sketch',
+            mime: 'image/svg+xml',
+          } as ProjectFile,
+          {
+            name: 'board.sketch.json',
+            path: 'board.sketch.json',
+            size: 2048,
+            mtime: 1700000004,
+            kind: 'sketch',
+            mime: 'application/json',
+          } as ProjectFile,
+        ]}
+      />,
+    );
+
+    expect(screen.getByText('diagram.svg')).toBeTruthy();
+    expect(screen.queryByText('board.sketch.json')).toBeNull();
+  });
+
+  it('keeps explicitly recorded sketch outputs visible', () => {
+    render(
+      <AssistantMessage
+        message={baseMessage({
+          producedFiles: [
+            {
+              name: 'agent-sketch.sketch.json',
+              path: 'agent-sketch.sketch.json',
+              size: 2048,
+              mtime: 1700000004,
+              kind: 'sketch',
+              mime: 'application/json',
+            } as ProjectFile,
+          ],
+        })}
+        streaming={false}
+        projectId="proj-1"
+      />,
+    );
+
+    expect(screen.getByText('agent-sketch.sketch.json')).toBeTruthy();
   });
 });

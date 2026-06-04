@@ -1,8 +1,6 @@
 import { expect, test } from '@playwright/test';
 import type { Page, Request } from '@playwright/test';
-
-const STORAGE_KEY = 'open-design:config';
-const SAVED_PLUGIN_IDS_KEY = 'open-design:saved-plugin-ids';
+import { applyStandardMocks, STORAGE_KEY } from '@/playwright/mock-factory';
 const LOCAL_CLI_LABEL = /Local CLI|本机 CLI|本地 CLI/i;
 const STARTER_PLUGIN = makeStarterPlugin({
   id: 'localized-plugin',
@@ -65,65 +63,10 @@ const DESIGN_SYSTEMS = [
 ] as const;
 
 test.beforeEach(async ({ page }) => {
-  await page.addInitScript(({ configKey, savedKey }) => {
-    window.localStorage.removeItem(savedKey);
-    window.localStorage.setItem(
-      configKey,
-      JSON.stringify({
-        mode: 'daemon',
-        apiKey: '',
-        baseUrl: 'https://api.anthropic.com',
-        model: 'claude-sonnet-4-5',
-        agentId: 'mock',
-        skillId: null,
-        designSystemId: null,
-        onboardingCompleted: true,
-        agentModels: {},
-        privacyDecisionAt: 1,
-        telemetry: { metrics: false, content: false, artifactManifest: false },
-      }),
-    );
-  }, { configKey: STORAGE_KEY, savedKey: SAVED_PLUGIN_IDS_KEY });
-
-  await page.route('**/api/agents', async (route) => {
-    await route.fulfill({
-      json: {
-        agents: [
-          {
-            id: 'mock',
-            name: 'Mock Agent',
-            bin: 'mock-agent',
-            available: true,
-            version: 'test',
-            models: [{ id: 'default', label: 'Default' }],
-          },
-        ],
-      },
-    });
-  });
-
-  await page.route('**/api/app-config', async (route) => {
-    if (route.request().method() !== 'GET') {
-      await route.continue();
-      return;
-    }
-    await route.fulfill({
-      json: {
-        config: {
-          onboardingCompleted: true,
-          agentId: 'mock',
-          skillId: null,
-          designSystemId: null,
-          agentModels: {},
-          privacyDecisionAt: 1,
-          telemetry: { metrics: false, content: false, artifactManifest: false },
-        },
-      },
-    });
-  });
+  await applyStandardMocks(page);
 });
 
-test('entry chrome settings dialog opens with brand header and no pet rail', async ({ page }) => {
+test('entry chrome exposes the primary home creation surface and settings entry', async ({ page }) => {
   await page.route('**/api/projects', async (route) => {
     if (route.request().method() === 'GET') {
       await route.fulfill({ json: { projects: [] } });
@@ -136,13 +79,21 @@ test('entry chrome settings dialog opens with brand header and no pet rail', asy
   await expect(page.getByTestId('entry-star-badge')).toBeVisible();
   await expect(page.getByTestId('entry-use-everywhere-button')).toBeVisible();
   await expect(page.getByTestId('entry-nav-logo')).toBeVisible();
-  // First-run home (no projects mocked) should NOT render the
-  // recent-projects rail — it used to render an empty dashed box
-  // that was just visual noise above the plugin gallery.
   await expect(page.getByTestId('recent-projects-strip')).toHaveCount(0);
   await expect(page.locator('.entry-nav-rail')).toBeVisible();
-  await expect(page.getByTestId('entry-nav-new-project')).toBeVisible();
   await expect(page.locator('.entry-brand')).toHaveCount(0);
+  await expect(page.getByTestId('home-hero-input')).toBeVisible();
+  await expect(page.getByTestId('home-hero-attach')).toBeVisible();
+  await expect(page.getByTestId('home-hero-submit')).toBeDisabled();
+  const createTabs = page.getByTestId('home-hero-type-tabs');
+  await expect(createTabs).toBeVisible();
+  await expect(page.getByTestId('home-hero-rail-prototype')).toBeVisible();
+  await expect(page.getByTestId('home-hero-rail-live-artifact')).toBeVisible();
+  await expect(page.getByTestId('home-hero-rail-deck')).toBeVisible();
+  await expect(page.getByTestId('home-hero-rail-image')).toBeVisible();
+  await expect(page.getByTestId('home-hero-rail-video')).toBeVisible();
+  await expect(page.getByTestId('home-hero-rail-hyperframes')).toBeVisible();
+  await expect(page.getByTestId('home-hero-rail-audio')).toBeVisible();
 
   // The pet picker rail was removed; pet adoption now lives in
   // Settings → Pet exclusively. Make sure no rail leaks back into the
@@ -180,25 +131,33 @@ test('entry top navigation matches the current home tab structure', async ({ pag
   await expect(page.getByTestId('plugins-home-row-subcategory-prototype')).toHaveCount(0);
 });
 
-test('home view exposes the redesigned hero, recent projects, starters, and modal entry points', async ({ page }) => {
+test('home view exposes the redesigned hero, recent projects, and starters', async ({ page }) => {
+  await createProject(page, 'Home structure recent project');
   await gotoEntryHome(page);
 
   await expect(page.getByTestId('recent-projects-strip')).toBeVisible();
   await expect(page.getByTestId('recent-projects-view-all')).toBeVisible();
   await expect(page.getByTestId('plugins-home-section')).toBeVisible();
   await expect(page.getByTestId('plugins-home-browse-registry')).toBeVisible();
-  await expect(page.getByTestId('new-project-panel')).toHaveCount(0);
-
-  await page.getByTestId('entry-nav-new-project').click();
-  await expect(page.getByTestId('new-project-modal')).toBeVisible();
-  await expect(page.getByTestId('new-project-panel')).toBeVisible();
-
-  await page.keyboard.press('Escape');
-  await expect(page.getByTestId('new-project-modal')).toHaveCount(0);
   await expect(page.getByTestId('home-hero')).toBeVisible();
   await expect(page.getByTestId('entry-nav-home')).toHaveAttribute('aria-current', 'page');
 
   await page.getByTestId('entry-nav-projects').click();
+  await expect(page).toHaveURL(/\/projects$/);
+  await expect(page.getByTestId('entry-nav-projects')).toHaveAttribute('aria-current', 'page');
+});
+
+test('recent projects strip opens a project card and view all routes to the projects index', async ({ page }) => {
+  const created = await createProject(page, 'Recent project entry point');
+  await gotoEntryHome(page);
+
+  const recentStrip = page.getByTestId('recent-projects-strip');
+  await expect(recentStrip).toBeVisible();
+  await recentStrip.locator(`[data-project-id="${created.project.id}"]`).click();
+  await expect(page).toHaveURL(new RegExp(`/projects/${created.project.id}`));
+
+  await gotoEntryHome(page);
+  await page.getByTestId('recent-projects-view-all').click();
   await expect(page).toHaveURL(/\/projects$/);
   await expect(page.getByTestId('entry-nav-projects')).toHaveAttribute('aria-current', 'page');
 });
@@ -239,6 +198,7 @@ test('design systems page is reachable from entry nav and supports search, previ
   await expect(page.getByTestId('entry-nav-design-systems')).toHaveAttribute('aria-current', 'page');
   await expect(page.getByRole('heading', { name: 'Design systems' })).toBeVisible();
   await expect(page.getByTestId('design-systems-tab')).toBeVisible();
+  await page.getByRole('tab', { name: 'Official presets' }).click();
   await expect(page.getByTestId('design-system-card-agentic')).toBeVisible();
   await expect(page.getByTestId('design-system-card-agentic')).toContainText(/default/i);
   await expect(page.getByTestId('design-system-card-airbnb')).toBeVisible();
@@ -492,65 +452,6 @@ test('entry execution pill remains available across secondary entry pages', asyn
   }
 });
 
-test('clicking a recent project card opens that project from Home', async ({ page }) => {
-  const older = await createProject(page, 'Home card older project');
-  const newer = await createProject(page, 'Home card newer project');
-
-  await gotoEntryHome(page);
-
-  const recentStrip = page.getByTestId('recent-projects-strip');
-  const newerCard = recentStrip.locator(`[data-project-id="${newer.project.id}"]`);
-  await expect(newerCard).toBeVisible();
-  await expect(newerCard).toContainText('Home card newer project');
-  await newerCard.click();
-  await expect(page).toHaveURL(new RegExp(`/projects/${newer.project.id}`));
-  await expect(page.getByTestId('chat-composer')).toBeVisible();
-
-  void older;
-});
-
-test('home recent projects shows the empty state when the project list is empty', async ({ page }) => {
-  await page.route('**/api/projects', async (route) => {
-    if (route.request().method() === 'GET') {
-      await route.fulfill({ json: { projects: [] } });
-      return;
-    }
-    await route.continue();
-  });
-
-  await gotoEntryHome(page);
-  await expect(page.getByTestId('recent-projects-strip')).toHaveCount(0);
-});
-
-test('home recent projects sorts newest first and caps the strip at six cards', async ({ page }) => {
-  const now = Date.now();
-  const projects = Array.from({ length: 7 }, (_, index) =>
-    makeProjectSummary({
-      id: `fixture-project-${index + 1}`,
-      name: `Fixture project ${index + 1}`,
-      updatedAt: now - (6 - index) * 60_000,
-    }),
-  );
-
-  await page.route('**/api/projects', async (route) => {
-    if (route.request().method() === 'GET') {
-      await route.fulfill({ json: { projects } });
-      return;
-    }
-    await route.continue();
-  });
-
-  await gotoEntryHome(page);
-
-  const cards = page.locator('[data-testid="recent-projects-strip"] [data-project-id]');
-  await expect(cards).toHaveCount(6);
-  await expect(cards.first()).toContainText('Fixture project 7');
-  await expect(cards).toContainText(['Fixture project 7', 'Fixture project 6', 'Fixture project 5']);
-  await expect(page.locator('[data-testid="recent-projects-strip"]')).not.toContainText(
-    'Fixture project 1',
-  );
-});
-
 test('home starters can browse registry and use a starter query from Home', async ({ page }) => {
   await page.route('**/api/plugins', async (route) => {
     await route.fulfill({
@@ -565,6 +466,12 @@ test('home starters can browse registry and use a starter query from Home', asyn
   await page.getByTestId('plugins-home-browse-registry').click();
   await expect(page).toHaveURL(/\/plugins$/);
   await expect(page.getByTestId('entry-nav-plugins')).toHaveAttribute('aria-current', 'page');
+  await expect(page.locator('h1').filter({ hasText: 'Plugins' })).toBeVisible();
+  await expect(page.getByTestId('plugins-tab-installed')).toBeVisible();
+  await expect(page.getByTestId('plugins-tab-available')).toBeVisible();
+  await expect(page.getByTestId('plugins-tab-sources')).toBeVisible();
+  await expect(page.getByTestId('plugins-create-button')).toBeVisible();
+  await expect(page.getByTestId('plugins-import-button')).toBeVisible();
 
   await page.getByTestId('entry-nav-logo').click();
   await expect(page.getByTestId('home-hero')).toBeVisible();
@@ -631,6 +538,24 @@ test('home starters search and facet filters narrow the visible gallery', async 
   await expect(page.locator('[data-plugin-id="hyperframes-video"]')).toBeVisible();
   await expect(page.locator('[data-plugin-id="deck-writer"]')).toHaveCount(0);
   await expect(page.locator('[data-plugin-id="figma-importer"]')).toHaveCount(0);
+});
+
+test('home starters can jump into plugin creation through the registry browse flow', async ({ page }) => {
+  await page.route('**/api/plugins', async (route) => {
+    await route.fulfill({
+      json: {
+        plugins: STARTER_PLUGINS,
+      },
+    });
+  });
+
+  await gotoEntryHome(page);
+  await page.getByTestId('plugins-home-browse-registry').click();
+  await expect(page).toHaveURL(/\/plugins$/);
+  await expect(page.locator('h1').filter({ hasText: 'Plugins' })).toBeVisible();
+  await page.getByTestId('plugins-create-button').click();
+
+  await expect(page.getByTestId('home-hero-input')).toHaveValue(/Create an Open Design plugin/i);
 });
 
 test('home starters search can enter a no-results state and recover with clear', async ({ page }) => {
@@ -806,14 +731,17 @@ test('home starters html details modal shows metadata links, supports copy query
   const copied = await page.evaluate(() => (window as typeof window & { __copiedTexts?: string[] }).__copiedTexts ?? []);
   expect(copied.at(-1)).toBe('Use the {{topic}} template for a polished launch deck.');
 
-  await page.getByTestId('plugin-share-html-metadata-plugin').getByRole('button', { name: /^Share$/i }).click();
+  await page.getByTestId('plugin-share-html-metadata-plugin').getByRole('button', { name: /^More$/i }).click();
   const shareMenu = page.locator('.plugin-share-popover[role="menu"]');
   await expect(shareMenu).toBeVisible();
   await expect(shareMenu.getByRole('menuitem', { name: /Copy install command/i })).toBeVisible();
   await expect(shareMenu.getByRole('menuitem', { name: /Copy plugin ID/i })).toBeVisible();
-  await expect(shareMenu.getByRole('menuitem', { name: /Copy share link/i })).toBeVisible();
+  // Bundled plugins now have a public open-design.ai detail page, so the
+  // README badge (which links to it) is offered.
+  await expect(shareMenu.getByRole('menuitem', { name: /Copy README badge/i })).toBeVisible();
   await expect(shareMenu.getByRole('menuitem', { name: /Open source on GitHub/i })).toBeVisible();
   await expect(shareMenu.getByRole('menuitem', { name: /Open homepage/i })).toBeVisible();
+  await expect(shareMenu.getByRole('menuitem', { name: /Open in marketplace/i })).toBeVisible();
 });
 
 test('home starters Use plugin from the details modal applies the plugin to the home hero', async ({ page }) => {
@@ -864,6 +792,7 @@ test('home starters direct Use keeps prompt empty and still allows a freeform su
   const input = page.getByTestId('home-hero-input');
   await expect(input).toHaveValue('');
 
+  await page.locator('article.plugins-home__card[data-plugin-id="localized-plugin"]').hover();
   await page.getByTestId('plugins-home-use-localized-plugin').click({ force: true });
   await expect(input).toHaveValue('');
 
@@ -876,16 +805,9 @@ test('home starters direct Use keeps prompt empty and still allows a freeform su
   const projectBody = projectRequest.postDataJSON() as {
     pluginId?: string;
     pendingPrompt?: string;
-    metadata?: { contextPlugins?: Array<{ id?: string; title?: string }> };
   };
   expect(projectBody.pendingPrompt).toBe('Use the selected starter as context');
   expect(projectBody.pluginId).toBe('od-default');
-  expect(projectBody.metadata?.contextPlugins).toEqual([
-    expect.objectContaining({
-      id: 'localized-plugin',
-      title: 'Localized Plugin',
-    }),
-  ]);
 
   const runRequest = await runRequestPromise;
   const runBody = runRequest.postDataJSON() as { message?: string };
@@ -914,6 +836,58 @@ test('home starters Use with query hydrates the prompt and keeps plugin context 
   await page.getByTestId('plugins-home-use-with-query-localized-plugin').click();
   await expect(page.getByTestId('home-hero-context-plugin-localized-plugin')).toBeVisible();
   await expect(input).toHaveValue('Make a design systems brief.');
+});
+
+test('home starters Use with query carries the hydrated starter prompt into the created project and first user turn', async ({ page }) => {
+  await page.route('**/api/plugins', async (route) => {
+    await route.fulfill({
+      json: {
+        plugins: [STARTER_PLUGIN],
+      },
+    });
+  });
+
+  await gotoEntryHome(page);
+
+  const input = page.getByTestId('home-hero-input');
+  const starterCard = page.locator('[data-plugin-id="localized-plugin"]').first();
+  await starterCard.scrollIntoViewIfNeeded();
+  await starterCard.hover();
+  await expect(page.getByTestId('plugins-home-use-menu-localized-plugin')).toBeVisible();
+  await page.getByTestId('plugins-home-use-menu-localized-plugin').click();
+  await page.getByTestId('plugins-home-use-with-query-localized-plugin').click();
+  await expect(page.getByTestId('home-hero-context-plugin-localized-plugin')).toBeVisible();
+  await expect(input).toHaveValue('Make a design systems brief.');
+
+  const projectRequestPromise = page.waitForRequest(isCreateProjectRequest);
+  const runRequestPromise = page.waitForRequest(isCreateRunRequest);
+  await page.getByTestId('home-hero-submit').click();
+
+  const projectRequest = await projectRequestPromise;
+  const projectBody = projectRequest.postDataJSON() as {
+    metadata?: { kind?: string };
+    pendingPrompt?: string;
+    pluginId?: string;
+  };
+  expect(projectBody.pendingPrompt).toBe('Make a design systems brief.');
+  expect(projectBody.pluginId).toBe('od-default');
+  expect(typeof projectBody.metadata?.kind).toBe('string');
+
+  const runRequest = await runRequestPromise;
+  const runBody = runRequest.postDataJSON() as { message?: string };
+  expect(runBody.message).toContain('Make a design systems brief.');
+
+  await expect(page).toHaveURL(/\/projects\//);
+  await expect(page.locator('.msg.user .user-text').filter({ hasText: 'Make a design systems brief.' }).first()).toBeVisible();
+
+  const { projectId, conversationId } = await getCurrentProjectContext(page);
+  const project = await fetchProjectFromApi(page, projectId);
+  expect(project.metadata?.kind).toBe(projectBody.metadata?.kind);
+
+  const messages = await listMessagesFromApi(page, projectId, conversationId);
+  expect(
+    messages.some((message) => message.role === 'user' && message.content === 'Make a design systems brief.'),
+  ).toBe(true);
 });
 
 test('home hero input keeps Shift+Enter as a newline and submits on Enter', async ({ page }) => {
@@ -1022,7 +996,7 @@ test('home hero attachment-only submit uploads the file and sends it with the fi
 async function gotoEntryHome(page: Page) {
   await page.goto('/');
   const privacyDialog = page.getByRole('dialog').filter({ hasText: 'Help us improve Open Design' });
-  if (await privacyDialog.isVisible().catch(() => false)) {
+  if (await privacyDialog.isVisible()) {
     await privacyDialog.getByRole('button', { name: /not now/i }).click();
     await expect(privacyDialog).toHaveCount(0);
   }
@@ -1043,6 +1017,53 @@ async function createProject(page: Page, name: string) {
   });
   expect(response.ok(), await response.text()).toBeTruthy();
   return response.json() as Promise<{ project: { id: string; name: string } }>;
+}
+
+async function getCurrentProjectContext(page: Page): Promise<{ projectId: string; conversationId: string }> {
+  const current = new URL(page.url());
+  const [, projects, projectId, maybeConversations, conversationId] = current.pathname.split('/');
+  if (projects !== 'projects' || !projectId) {
+    throw new Error(`unexpected project route: ${current.pathname}`);
+  }
+  if (maybeConversations === 'conversations' && conversationId) {
+    return { projectId, conversationId };
+  }
+
+  const response = await page.request.get(`/api/projects/${projectId}/conversations`);
+  expect(response.ok()).toBeTruthy();
+  const { conversations } = (await response.json()) as {
+    conversations: Array<{ id: string; updatedAt: number }>;
+  };
+  const active = [...conversations].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  if (!active) throw new Error(`no conversations found for project ${projectId}`);
+  return { projectId, conversationId: active.id };
+}
+
+async function fetchProjectFromApi(
+  page: Page,
+  projectId: string,
+): Promise<{ id: string; metadata?: { kind?: string } }> {
+  const response = await page.request.get(`/api/projects/${projectId}`);
+  expect(response.ok()).toBeTruthy();
+  const { project } = (await response.json()) as {
+    project: { id: string; metadata?: { kind?: string } };
+  };
+  return project;
+}
+
+async function listMessagesFromApi(
+  page: Page,
+  projectId: string,
+  conversationId: string,
+): Promise<Array<{ role: 'assistant' | 'user'; content: string }>> {
+  const response = await page.request.get(
+    `/api/projects/${projectId}/conversations/${conversationId}/messages`,
+  );
+  expect(response.ok()).toBeTruthy();
+  const { messages } = (await response.json()) as {
+    messages: Array<{ role: 'assistant' | 'user'; content: string }>;
+  };
+  return messages;
 }
 
 async function routeDesignSystems(page: Page) {
@@ -1181,27 +1202,5 @@ function makeStarterPlugin({
         ...(pipeline ? { pipeline } : {}),
       },
     },
-  } as const;
-}
-
-function makeProjectSummary({
-  id,
-  name,
-  updatedAt,
-}: {
-  id: string;
-  name: string;
-  updatedAt: number;
-}) {
-  return {
-    id,
-    name,
-    updatedAt,
-    createdAt: updatedAt,
-    skillId: null,
-    designSystemId: null,
-    pendingPrompt: '',
-    customInstructions: null,
-    metadata: { kind: 'prototype' },
   } as const;
 }

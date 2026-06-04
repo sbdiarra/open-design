@@ -50,8 +50,10 @@ import type {
   ProviderModelsRequest,
   ProviderModelsResponse,
   Project,
+  ProjectLocationPrefs,
   ProjectPlatform,
   PreviewCommentMember,
+  PreviewAnnotationStyle,
   PreviewCommentSelectionKind,
   PreviewComment,
   PreviewCommentStatus,
@@ -85,7 +87,9 @@ export type {
   ChatCommentSelectionKind,
   OrbitRunSummary,
   OrbitStatusResponse,
+  ProjectLocation,
   PreviewCommentMember,
+  PreviewAnnotationStyle,
   PreviewCommentSelectionKind,
   PreviewVisualMarkKind,
 } from '@open-design/contracts';
@@ -172,6 +176,7 @@ export interface MediaProviderCredentials {
   model?: string;
   apiKeyConfigured?: boolean;
   apiKeyTail?: string;
+  source?: string;
 }
 
 export interface ApiProtocolConfig {
@@ -366,6 +371,8 @@ export interface AppConfig {
   // PrivacySection persist it through `syncConfigToDaemon`.
   telemetry?: TelemetryConfig;
   customInstructions?: string;
+  projectLocations?: ProjectLocationPrefs[];
+  defaultProjectLocationId?: string | null;
 }
 
 export interface TelemetryConfig {
@@ -520,4 +527,5 @@ export type {
 export interface OpenTabsState {
   tabs: ProjectWorkspaceTabId[];
   active: ProjectWorkspaceTabId | null;
+  hasSavedState?: boolean;
 }

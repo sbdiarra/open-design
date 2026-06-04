@@ -17,12 +17,13 @@ import {
   useState,
 } from 'react';
 import type {
+  CSSProperties,
   ClipboardEvent as ReactClipboardEvent,
   DragEvent as ReactDragEvent,
   ForwardedRef,
   KeyboardEvent as ReactKeyboardEvent,
-  RefObject,
   ReactNode,
+  RefObject,
 } from 'react';
 import type {
   ConnectorDetail,
@@ -31,6 +32,7 @@ import type {
   McpServerConfig,
 } from '@open-design/contracts';
 import type { SkillSummary } from '../types';
+import { isImeComposing } from '../utils/imeComposing';
 import { Icon, type IconName } from './Icon';
 import { PluginInputsForm } from './PluginInputsForm';
 import { useAnalytics } from '../analytics/provider';
@@ -421,6 +423,15 @@ export const HomeHero = forwardRef<HTMLTextAreaElement, Props>(function HomeHero
       : [],
     [activeChipId, activeExamplePlugins.length, locale],
   );
+  const authoringLayoutActive =
+    activeChipId === 'create-plugin' || pendingChipId === 'create-plugin';
+  const promptMaxHeight = authoringLayoutActive
+    ? HOME_HERO_AUTHORING_PROMPT_MAX_HEIGHT
+    : HOME_HERO_PROMPT_MAX_HEIGHT;
+  const inputCardStyle = {
+    '--home-hero-prompt-max-height': `${promptMaxHeight}px`,
+  } as CSSProperties;
+
   useEffect(() => {
     if (selectedIndex >= visiblePickerOptions.length) setSelectedIndex(0);
   }, [selectedIndex, visiblePickerOptions.length]);
@@ -463,16 +474,16 @@ export const HomeHero = forwardRef<HTMLTextAreaElement, Props>(function HomeHero
     const el = inputElementRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    const nextHeight = Math.min(el.scrollHeight, HOME_HERO_PROMPT_MAX_HEIGHT);
+    const nextHeight = Math.min(el.scrollHeight, promptMaxHeight);
     el.style.height = `${nextHeight}px`;
-    el.style.overflowY = el.scrollHeight > HOME_HERO_PROMPT_MAX_HEIGHT ? 'auto' : 'hidden';
-    if (el.scrollHeight <= HOME_HERO_PROMPT_MAX_HEIGHT && el.scrollTop !== 0) {
+    el.style.overflowY = el.scrollHeight > promptMaxHeight ? 'auto' : 'hidden';
+    if (el.scrollHeight <= promptMaxHeight && el.scrollTop !== 0) {
       el.scrollTop = 0;
       setPromptScrollTop(0);
     } else {
       setPromptScrollTop(el.scrollTop);
     }
-  }, [pluginInputValues, prompt, promptOverlayParts]);
+  }, [pluginInputValues, prompt, promptMaxHeight, promptOverlayParts]);
 
   const setInputRef = useCallback(
     (node: HTMLTextAreaElement | null) => {
@@ -525,6 +536,13 @@ export const HomeHero = forwardRef<HTMLTextAreaElement, Props>(function HomeHero
   function handleFiles(files: File[]) {
     if (files.length === 0) return;
     onAddFiles(files);
+  }
+
+  function clearSelectedPromptExample() {
+    if (selectedPromptExample) {
+      onPromptChange('');
+    }
+    setSelectedPromptExample(null);
   }
 
   function usePromptExample(example: string) {
@@ -629,7 +647,10 @@ export const HomeHero = forwardRef<HTMLTextAreaElement, Props>(function HomeHero
       </p>
 
       <div
-        className={`home-hero__input-card${dragActive ? ' is-drag-active' : ''}`}
+        className={`home-hero__input-card${
+          authoringLayoutActive ? ' home-hero__input-card--compact-authoring' : ''
+        }${dragActive ? ' is-drag-active' : ''}`}
+        style={inputCardStyle}
         onDragEnter={(event) => {
           if (event.dataTransfer.types.includes('Files')) setDragActive(true);
         }}
@@ -693,15 +714,17 @@ export const HomeHero = forwardRef<HTMLTextAreaElement, Props>(function HomeHero
                   <span className="home-hero__active-dot" aria-hidden />
                   <span>{activePluginTitle}</span>
                 </button>
-                <button
-                  type="button"
-                  className="home-hero__active-clear"
-                  onClick={onClearActivePlugin}
-                  aria-label={t('homeHero.clearActivePlugin')}
-                  title={t('homeHero.clearActivePlugin')}
-                >
-                  ×
-                </button>
+                {activeCreateChip ? null : (
+                  <button
+                    type="button"
+                    className="home-hero__active-clear"
+                    onClick={onClearActivePlugin}
+                    aria-label={t('homeHero.clearActivePlugin')}
+                    title={t('homeHero.clearActivePlugin')}
+                  >
+                    ×
+                  </button>
+                )}
               </span>
             ) : null}
             {activeSkillTitle ? (
@@ -732,7 +755,7 @@ export const HomeHero = forwardRef<HTMLTextAreaElement, Props>(function HomeHero
                 <button
                   type="button"
                   className="home-hero__active-clear"
-                  onClick={() => setSelectedPromptExample(null)}
+                  onClick={clearSelectedPromptExample}
                   aria-label={t('common.close')}
                   title={t('common.close')}
                 >
@@ -1145,7 +1168,6 @@ export const HomeHero = forwardRef<HTMLTextAreaElement, Props>(function HomeHero
                 onClick={() => usePromptExample(example)}
               >
                 <span>{example}</span>
-                <Icon name="external-link" size={14} aria-hidden />
               </button>
             ))}
           </div>
@@ -1338,6 +1360,7 @@ interface PromptHighlightPart {
 
 const INPUT_PLACEHOLDER_PATTERN = /\{\{\s*([a-zA-Z_][\w-]*)\s*\}\}/g;
 const HOME_HERO_PROMPT_MAX_HEIGHT = 180;
+const HOME_HERO_AUTHORING_PROMPT_MAX_HEIGHT = 132;
 
 function buildPromptHighlightParts(
   template: string | null,
@@ -2316,11 +2339,6 @@ function replaceMentionTokenWithText(
   const before = value.slice(0, mention.start).trimEnd();
   const after = value.slice(mention.end).trimStart();
   return [before, replacement.trim(), after].filter(Boolean).join(' ').trim();
-}
-
-function isImeComposing(event: ReactKeyboardEvent<HTMLTextAreaElement>, composing: boolean): boolean {
-  const nativeEvent = event.nativeEvent as KeyboardEvent & { keyCode?: number };
-  return composing || nativeEvent.isComposing || nativeEvent.keyCode === 229;
 }
 
 function pluginMatchesQuery(plugin: InstalledPluginRecord, query: string): boolean {

@@ -1,10 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Button } from '@open-design/components';
 import { useAnalytics } from '../analytics/provider';
 import { trackFileManagerClick } from '../analytics/events';
 import { useT } from '../i18n';
 import type { Dict } from '../i18n/types';
-import { projectFileUrl } from '../providers/registry';
+import { projectFileUrl, projectRawUrl } from '../providers/registry';
+import { buildSrcdoc } from '../runtime/srcdoc';
 import type { LiveArtifactWorkspaceEntry, ProjectFile, ProjectFileKind } from '../types';
+import {
+  createFileSystemReadError,
+  FILE_SYSTEM_READ_ERROR_MESSAGE,
+  isFileSystemReadError,
+} from '../utils/fileSystemErrors';
 import type { PluginFolderAgentAction } from './design-files/pluginFolderActions';
 import { getPluginFolderCandidates } from './design-files/pluginFolders';
 import { Icon } from './Icon';
@@ -46,6 +53,70 @@ type DesignFilesGroupMode = 'kind' | 'modified';
 type ModifiedSection = 'today' | 'yesterday' | 'previous7Days' | 'previous30Days' | 'older';
 type SortKey = 'name' | 'kind' | 'mtime';
 type SortDir = 'asc' | 'desc';
+
+// Storage key for per-project view state. Bump the version suffix (v1 → v2) when
+// removing or renaming a persisted field — just adding an optional field is safe
+// without a version bump. No cleanup of old keys on project deletion; the keys
+// are small preference blobs and orphan gracefully.
+const VIEW_STATE_KEY_PREFIX = 'od:design-files:view-state:v1:';
+
+const DEFAULT_SORT_KEY: SortKey = 'mtime';
+const DEFAULT_SORT_DIR: SortDir = 'desc';
+const DEFAULT_PAGE_SIZE: number | 'all' = 30;
+const PAGE_SIZE_OPTIONS = [15, 30, 45, 60, 'all'] as const;
+
+interface PersistedViewState {
+  sortKey?: SortKey;
+  sortDir?: SortDir;
+  pageSize?: number | 'all';
+  kindFilter?: string[];
+}
+
+function readViewState(projectId: string): PersistedViewState {
+  try {
+    if (typeof window === 'undefined') return {};
+    const raw = localStorage.getItem(VIEW_STATE_KEY_PREFIX + projectId);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed as PersistedViewState;
+  } catch {
+    return {};
+  }
+}
+
+function writeViewState(projectId: string, state: PersistedViewState): void {
+  try {
+    localStorage.setItem(VIEW_STATE_KEY_PREFIX + projectId, JSON.stringify(state));
+  } catch {
+    // localStorage unavailable (private mode, quota exceeded) — silently skip
+  }
+}
+
+function isSortKey(v: unknown): v is SortKey {
+  return v === 'name' || v === 'kind' || v === 'mtime';
+}
+
+function isSortDir(v: unknown): v is SortDir {
+  return v === 'asc' || v === 'desc';
+}
+
+function isPageSize(v: unknown): v is number | 'all' {
+  return (PAGE_SIZE_OPTIONS as ReadonlyArray<unknown>).includes(v);
+}
+
+// Validate that a value is one of the known ProjectFileKind literals. This
+// guards against stored values that were valid under a previous schema but
+// are no longer part of the union — they are silently dropped rather than
+// poisoning the kindFilter state.
+const VALID_KIND_SET: ReadonlySet<string> = new Set<ProjectFileKind>([
+  'html', 'image', 'video', 'audio', 'sketch', 'text',
+  'code', 'pdf', 'document', 'presentation', 'spreadsheet', 'binary',
+]);
+
+function isProjectFileKind(v: unknown): v is ProjectFileKind {
+  return typeof v === 'string' && VALID_KIND_SET.has(v);
+}
 type FileSystemEntryWithReader = FileSystemEntry & {
   createReader?: () => FileSystemDirectoryReader;
 };
@@ -133,6 +204,7 @@ export function DesignFilesPanel({
   const analytics = useAnalytics();
   const [refreshing, setRefreshing] = useState(false);
   const [draggingFiles, setDraggingFiles] = useState(false);
+  const [dropReadError, setDropReadError] = useState<string | null>(null);
   const dragDepthRef = useRef(0);
   const [hover, setHover] = useState<string | null>(null);
   const [menuPos, setMenuPos] = useState<{ name: string; top: number; left: number } | null>(null);
@@ -140,8 +212,27 @@ export function DesignFilesPanel({
   const MENU_SAFE_PADDING = 8;
   const [preview, setPreview] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [sortKey, setSortKey] = useState<SortKey>('mtime');
-  const [sortDir, setSortDir] = useState<SortDir>('desc');
+  // Read once at mount; projectId is stable for this component instance
+  // (parent uses key={projectId} to remount on project switch).
+  const savedViewState = useRef(readViewState(projectId));
+  // Guard for the persist useEffect: skip the initial write so we only
+  // flush to localStorage when the user actually changes a preference.
+  // Without this, every project the user opens gets a default-value entry
+  // written on first render, making stale-key garbage grow unbounded.
+  // Note: React 18 StrictMode (active in next dev) fires effects twice,
+  // keeping refs intact across the simulated remount. This means the guard
+  // fires on the first effect run, sets the ref true, and the second run
+  // then writes the defaults. The result is a harmless default-value entry
+  // for the project; subsequent user changes overwrite it correctly. The
+  // invariant ("no write without a user action") only holds in production
+  // builds where StrictMode is not active.
+  const viewStateHasMounted = useRef(false);
+  const [sortKey, setSortKey] = useState<SortKey>(
+    () => isSortKey(savedViewState.current.sortKey) ? savedViewState.current.sortKey : DEFAULT_SORT_KEY,
+  );
+  const [sortDir, setSortDir] = useState<SortDir>(
+    () => isSortDir(savedViewState.current.sortDir) ? savedViewState.current.sortDir : DEFAULT_SORT_DIR,
+  );
   const lastKeyPress = useRef<Map<string, number>>(new Map());
   const [deleting, setDeleting] = useState(false);
   const [installingFolder, setInstallingFolder] = useState<string | null>(null);
@@ -153,15 +244,45 @@ export function DesignFilesPanel({
   >(new Set());
   const [renaming, setRenaming] = useState<{ name: string; draft: string; saving: boolean } | null>(null);
   const [dayBoundary, setDayBoundary] = useState(() => Date.now());
-  const [kindFilter, setKindFilter] = useState<Set<ProjectFileKind>>(() => new Set());
+  const [kindFilter, setKindFilter] = useState<Set<ProjectFileKind>>(() => {
+    const { kindFilter: kf } = savedViewState.current;
+    if (!Array.isArray(kf) || kf.length === 0) return new Set();
+    // Validate each stored value against the current ProjectFileKind union so
+    // stale values from a prior schema (e.g. a renamed kind) are dropped silently.
+    return new Set(kf.filter(isProjectFileKind));
+  });
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
   const filterMenuRef = useRef<HTMLDivElement | null>(null);
+  const [currentDir, setCurrentDir] = useState<string>('');
+
+  // Derive immediate subdirectories and files at the current directory level
+  // from the flat files list. Files with names like "a/b/c.html" contribute
+  // "a" as a directory when currentDir is '' and "b" when currentDir is "a".
+  const { dirsAtCurrentDir, filesAtCurrentDir } = useMemo(() => {
+    const prefix = currentDir === '' ? '' : `${currentDir}/`;
+    const dirs = new Set<string>();
+    const localFiles: ProjectFile[] = [];
+    for (const f of files) {
+      if (!f.name.startsWith(prefix)) continue;
+      const remainder = f.name.slice(prefix.length);
+      const slashIdx = remainder.indexOf('/');
+      if (slashIdx === -1) {
+        localFiles.push(f);
+      } else {
+        dirs.add(remainder.slice(0, slashIdx));
+      }
+    }
+    return {
+      dirsAtCurrentDir: [...dirs].sort((a, b) => a.localeCompare(b)),
+      filesAtCurrentDir: localFiles,
+    };
+  }, [files, currentDir]);
 
   const kindCounts = useMemo(() => {
     const counts = new Map<ProjectFileKind, number>();
-    for (const f of files) counts.set(f.kind, (counts.get(f.kind) ?? 0) + 1);
+    for (const f of filesAtCurrentDir) counts.set(f.kind, (counts.get(f.kind) ?? 0) + 1);
     return counts;
-  }, [files]);
+  }, [filesAtCurrentDir]);
 
   const availableKinds = useMemo(
     () =>
@@ -174,7 +295,12 @@ export function DesignFilesPanel({
   // Drop any selected-filter kinds that no longer appear in the file list
   // (e.g. after a delete leaves the kind empty). Keeps the filter UI honest
   // and prevents a stale filter from silently hiding everything.
+  // Guard: skip when no kinds are available yet — availableKinds is empty only
+  // when files haven't loaded. Running cleanup against an empty set would
+  // clear a kindFilter that was correctly restored from localStorage before
+  // the async file list arrived.
   useEffect(() => {
+    if (availableKinds.length === 0) return;
     setKindFilter((prev) => {
       if (prev.size === 0) return prev;
       const present = new Set(availableKinds);
@@ -189,9 +315,9 @@ export function DesignFilesPanel({
   }, [availableKinds]);
 
   const filteredFiles = useMemo(() => {
-    if (kindFilter.size === 0) return files;
-    return files.filter((f) => kindFilter.has(f.kind));
-  }, [files, kindFilter]);
+    if (kindFilter.size === 0) return filesAtCurrentDir;
+    return filesAtCurrentDir.filter((f) => kindFilter.has(f.kind));
+  }, [filesAtCurrentDir, kindFilter]);
 
   const sortedFiles = useMemo(() => {
     return [...filteredFiles].sort((a, b) => {
@@ -204,7 +330,9 @@ export function DesignFilesPanel({
   }, [filteredFiles, sortKey, sortDir]);
 
   const [page, setPage] = useState(0);
-  const [pageSize, setPageSize] = useState<number | 'all'>(30);
+  const [pageSize, setPageSize] = useState<number | 'all'>(
+    () => isPageSize(savedViewState.current.pageSize) ? savedViewState.current.pageSize : DEFAULT_PAGE_SIZE,
+  );
 
   const effectivePageSize = pageSize === 'all' ? Math.max(1, sortedFiles.length) : pageSize;
   const totalPages = Math.max(1, Math.ceil(sortedFiles.length / effectivePageSize));
@@ -236,7 +364,7 @@ export function DesignFilesPanel({
   );
   const rangeStart = safePage * effectivePageSize + 1;
   const rangeEnd = Math.min((safePage + 1) * effectivePageSize, sortedFiles.length);
-  const allPageSelected = pageFiles.every((f) => selected.has(f.name));
+  const allPageSelected = pageFiles.length > 0 && pageFiles.every((f) => selected.has(f.name));
   const somePageSelected = !allPageSelected && pageFiles.some((f) => selected.has(f.name));
   const hasMultiplePages = totalPages > 1;
   const showListControls = sortedFiles.length > 15 || selected.size > 0;
@@ -244,6 +372,23 @@ export function DesignFilesPanel({
   useEffect(() => {
     setPage(0);
   }, [pageSize]);
+
+  // Persist view state so it survives navigation (the panel remounts via
+  // key={projectId} when the user tabs away and back).
+  // Skip the initial render: we only want to write when the user actually
+  // changes a preference, not on every project the user visits.
+  useEffect(() => {
+    if (!viewStateHasMounted.current) {
+      viewStateHasMounted.current = true;
+      return;
+    }
+    writeViewState(projectId, {
+      sortKey,
+      sortDir,
+      pageSize,
+      kindFilter: Array.from(kindFilter),
+    });
+  }, [projectId, sortKey, sortDir, pageSize, kindFilter]);
 
   // Reset to the first page when the filter changes — the previous page
   // index may no longer exist (or may now sit past the new totalPages).
@@ -270,6 +415,31 @@ export function DesignFilesPanel({
       return changed ? next : prev;
     });
   }, [filteredFiles, kindFilter]);
+
+  // Reset page, selection, and renaming state when the user navigates
+  // into or out of a directory.
+  useEffect(() => {
+    setPage(0);
+    setSelected(new Set());
+    setRenaming(null);
+  }, [currentDir]);
+
+  // Navigate up to the nearest ancestor that still exists when files under
+  // currentDir disappear (e.g. after deleting the last file in a subfolder).
+  useEffect(() => {
+    if (currentDir === '') return;
+    const prefix = `${currentDir}/`;
+    if (files.some((f) => f.name.startsWith(prefix))) return;
+    const parts = currentDir.split('/');
+    for (let i = parts.length - 1; i > 0; i--) {
+      const ancestor = parts.slice(0, i).join('/');
+      if (files.some((f) => f.name.startsWith(`${ancestor}/`))) {
+        setCurrentDir(ancestor);
+        return;
+      }
+    }
+    setCurrentDir('');
+  }, [files, currentDir]);
 
   // Outside-click + escape to close the filter popover. Stops short of a
   // full focus trap because the popover hosts only checkboxes plus a
@@ -438,12 +608,18 @@ export function DesignFilesPanel({
   function startRename(name: string) {
     setMenuPos(null);
     setPreview(name);
-    setRenaming({ name, draft: name, saving: false });
+    const draft = currentDir === '' ? name : name.slice(currentDir.length + 1);
+    setRenaming({ name, draft, saving: false });
   }
 
   async function commitRename(name: string, draft: string) {
-    const nextName = draft.trim();
-    if (!nextName || nextName === name) {
+    const nextBasename = draft.trim();
+    if (!nextBasename) {
+      setRenaming(null);
+      return;
+    }
+    const nextName = currentDir === '' ? nextBasename : `${currentDir}/${nextBasename}`;
+    if (nextName === name) {
       setRenaming(null);
       return;
     }
@@ -591,7 +767,12 @@ export function DesignFilesPanel({
               }}
             >
               <span className="df-row-name-wrap">
-                <span className="df-row-name">{f.name}</span>
+                <span
+                  className="df-row-name"
+                  title={currentDir === '' ? f.name : f.name.slice(currentDir.length + 1)}
+                >
+                  {currentDir === '' ? f.name : f.name.slice(currentDir.length + 1)}
+                </span>
                 <span className="df-row-sub">{humanBytes(f.size)}</span>
               </span>
             </button>
@@ -638,8 +819,38 @@ export function DesignFilesPanel({
     );
   }
 
+  function renderDirRow(dirName: string) {
+    const fullPath = currentDir === '' ? dirName : `${currentDir}/${dirName}`;
+    const prefix = `${fullPath}/`;
+    const count = files.filter((f) => f.name.startsWith(prefix)).length;
+    return (
+      <tr key={`dir:${fullPath}`} className="df-file-row df-dir-row">
+        <td className="df-cell-check" />
+        <td className="df-cell-icon df-cell-openable" onClick={() => setCurrentDir(fullPath)}>
+          <span className="df-row-icon" data-kind="folder" aria-hidden>
+            <Icon name="folder" size={14} />
+          </span>
+        </td>
+        <td className="df-cell-name df-cell-openable" onClick={() => setCurrentDir(fullPath)}>
+          <button type="button" className="df-row-name-btn" onClick={() => setCurrentDir(fullPath)}>
+            <span className="df-row-name-wrap">
+              <span className="df-row-name" title={dirName}>{dirName}</span>
+              <span className="df-row-sub">{t('designFiles.folderCount', { n: count })}</span>
+            </span>
+          </button>
+        </td>
+        <td className="df-cell-kind df-cell-openable" onClick={() => setCurrentDir(fullPath)}>
+          <span className="df-kind-label">{t('designFiles.kindFolder')}</span>
+        </td>
+        <td className="df-cell-time df-cell-openable" onClick={() => setCurrentDir(fullPath)} />
+        <td className="df-cell-menu" />
+      </tr>
+    );
+  }
+
   function renderModifiedSections() {
-    return visibleModifiedSections.flatMap((section) => {
+    const dirRows = dirsAtCurrentDir.map((d) => renderDirRow(d));
+    const sectionRows = visibleModifiedSections.flatMap((section) => {
       const sectionFiles = modifiedGroups[section];
       const collapsed = collapsedModifiedSections.has(section);
       const label = t(MODIFIED_SECTION_LABEL_KEY[section]);
@@ -662,9 +873,11 @@ export function DesignFilesPanel({
         ...(collapsed ? [] : sectionFiles.map(renderFileRow)),
       ];
     });
+    return [...dirRows, ...sectionRows];
   }
 
   function renderKindSections() {
+    const dirRows = dirsAtCurrentDir.map((d) => renderDirRow(d));
     const grouped = new Map<ProjectFileKind, ProjectFile[]>();
     for (const file of pageFiles) {
       const next = grouped.get(file.kind) ?? [];
@@ -672,7 +885,7 @@ export function DesignFilesPanel({
       grouped.set(file.kind, next);
     }
 
-    return [...grouped.entries()]
+    const kindRows = [...grouped.entries()]
       .sort(([a], [b]) => kindSortPriority(a) - kindSortPriority(b))
       .flatMap(([kind, kindFiles]) => [
         <tr className="df-section-row" key={`${kind}-label`}>
@@ -685,6 +898,7 @@ export function DesignFilesPanel({
         </tr>,
         ...kindFiles.map(renderFileRow),
       ]);
+    return [...dirRows, ...kindRows];
   }
 
   async function handleBatchDownload() {
@@ -728,8 +942,14 @@ export function DesignFilesPanel({
     ev.preventDefault();
     dragDepthRef.current = 0;
     setDraggingFiles(false);
-    const dropped = await filesFromDataTransfer(ev.dataTransfer);
-    if (dropped.length > 0) onUploadFiles(dropped);
+    setDropReadError(null);
+    try {
+      const dropped = await filesFromDataTransfer(ev.dataTransfer);
+      if (dropped.length > 0) onUploadFiles(dropped);
+    } catch (error) {
+      if (!isFileSystemReadError(error)) throw error;
+      setDropReadError(FILE_SYSTEM_READ_ERROR_MESSAGE);
+    }
   }
 
   async function handlePluginFolderAgentAction(
@@ -930,18 +1150,23 @@ export function DesignFilesPanel({
       </div>
     ) : null;
 
+  const visibleUploadError = uploadError ?? dropReadError;
+
   return (
     <div className={`df-panel ${preview ? '' : 'no-preview'}`}>
       <div className="df-main">
         <div className="df-body">
-          {uploadError && !preview ? (
+          {visibleUploadError && !preview ? (
             <div className="df-upload-banner" data-testid="upload-error-banner">
-              <span>{uploadError}</span>
-              {onClearUploadError ? (
+              <span>{visibleUploadError}</span>
+              {onClearUploadError || dropReadError ? (
                 <button
                   type="button"
                   data-testid="upload-error-dismiss"
-                  onClick={onClearUploadError}
+                  onClick={() => {
+                    setDropReadError(null);
+                    onClearUploadError?.();
+                  }}
                 >
                   Dismiss
                 </button>
@@ -954,6 +1179,37 @@ export function DesignFilesPanel({
             {kindFilterControl}
             {fileActions}
           </div>
+          {currentDir !== '' ? (
+            <nav className="df-breadcrumbs" aria-label={t('designFiles.crumbs')}>
+              <button
+                type="button"
+                className="df-breadcrumb-btn"
+                onClick={() => setCurrentDir('')}
+              >
+                {t('designFiles.crumbs')}
+              </button>
+              {currentDir.split('/').map((segment, idx, parts) => {
+                const path = parts.slice(0, idx + 1).join('/');
+                const isLast = idx === parts.length - 1;
+                return (
+                  <span key={path} className="df-breadcrumb-segment">
+                    <span className="df-breadcrumb-sep" aria-hidden>/</span>
+                    {isLast ? (
+                      <span className="df-breadcrumb-current">{segment}</span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="df-breadcrumb-btn"
+                        onClick={() => setCurrentDir(path)}
+                      >
+                        {segment}
+                      </button>
+                    )}
+                  </span>
+                );
+              })}
+            </nav>
+          ) : null}
           {files.length === 0 && liveArtifacts.length === 0 ? (
             <div className="df-empty" data-testid="design-files-empty">
               <div className="df-empty-pill">
@@ -990,7 +1246,9 @@ export function DesignFilesPanel({
                         ◉
                       </span>
                       <span className="df-row-name-wrap">
-                        <span className="df-row-name">{artifact.title}</span>
+                        <span className="df-row-name" title={artifact.title}>
+                          {artifact.title}
+                        </span>
                         <span className="df-row-sub">
                           <span>{t('designFiles.kindLiveArtifact')}</span>
                           <LiveArtifactBadges
@@ -1083,13 +1341,14 @@ export function DesignFilesPanel({
                   )})}
                 </div>
               ) : null}
-              {sortedFiles.length > 0 ? (
+              {(sortedFiles.length > 0 || dirsAtCurrentDir.length > 0) ? (
                 <>
                   {showListControls ? (
                     <div className="df-pagination df-pagination-start">
                       <label>
                         {t('designFiles.perPage')}:
                         <select
+                          data-testid="df-page-size-select"
                           value={pageSize === 'all' ? 'all' : pageSize}
                           onChange={(e) => {
                             const val = e.target.value;
@@ -1181,7 +1440,7 @@ export function DesignFilesPanel({
                         ? renderModifiedSections()
                         : groupMode === 'kind'
                           ? renderKindSections()
-                          : pageFiles.map(renderFileRow)}
+                          : [...dirsAtCurrentDir.map(renderDirRow), ...pageFiles.map(renderFileRow)]}
                     </tbody>
                   </table>
                   {hasMultiplePages ? (
@@ -1362,7 +1621,7 @@ function DfPreview({
         ) : file.kind === 'image' || file.kind === 'sketch' ? (
           <img src={`${url}?v=${Math.round(file.mtime)}`} alt={file.name} />
         ) : file.kind === 'html' ? (
-          <iframe title={file.name} src={url} sandbox="allow-scripts" />
+          <HtmlPreviewThumbnail projectId={projectId} file={file} />
         ) : file.kind === 'video' ? (
           <video
             src={`${url}?v=${Math.round(file.mtime)}`}
@@ -1399,10 +1658,10 @@ function DfPreview({
       </div>
       <div className="df-preview-meta" data-testid="design-file-preview">
         <div className="df-preview-actions">
-          <button type="button" className="ghost" onClick={onOpen}>
+          <Button variant="ghost" onClick={onOpen}>
             <Icon name="eye" size={13} />
             <span>{t('designFiles.previewOpen')}</span>
-          </button>
+          </Button>
           <a
             className="ghost-link"
             href={url}
@@ -1423,6 +1682,46 @@ function DfPreview({
       </div>
     </aside>
   );
+}
+
+function HtmlPreviewThumbnail({
+  projectId,
+  file,
+}: {
+  projectId: string;
+  file: ProjectFile;
+}) {
+  const url = projectFileUrl(projectId, file.name);
+  const [srcDoc, setSrcDoc] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`${url}?v=${Math.round(file.mtime)}`)
+      .then((response) => (response.ok ? response.text() : null))
+      .then((html) => {
+        if (cancelled || html === null) return;
+        setSrcDoc(buildSrcdoc(html, { baseHref: projectRawUrl(projectId, baseDirForFile(file.name)) }));
+      })
+      .catch(() => {
+        if (!cancelled) setSrcDoc(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [file.mtime, file.name, projectId, url]);
+
+  return (
+    <iframe
+      title={file.name}
+      src={srcDoc ? undefined : url}
+      srcDoc={srcDoc ?? undefined}
+      sandbox="allow-scripts allow-downloads"
+    />
+  );
+}
+
+function baseDirForFile(name: string): string {
+  const index = name.lastIndexOf('/');
+  return index >= 0 ? name.slice(0, index + 1) : '';
 }
 
 function kindSortPriority(kind: ProjectFileKind): number {
@@ -1475,11 +1774,17 @@ function dateDaysBefore(date: Date, days: number): Date {
 
 async function filesFromDataTransfer(dataTransfer: DataTransfer): Promise<File[]> {
   const items = Array.from(dataTransfer.items ?? []);
-  if (items.length === 0) return Array.from(dataTransfer.files ?? []);
+  const fallbackFiles = Array.from(dataTransfer.files ?? []);
+  if (items.length === 0) return fallbackFiles;
 
-  const files = await Promise.all(items.map(filesFromDataTransferItem));
-  const flattened = files.flat();
-  return flattened.length > 0 ? flattened : Array.from(dataTransfer.files ?? []);
+  const results = await Promise.allSettled(items.map(filesFromDataTransferItem));
+  const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (rejected) {
+    if (fallbackFiles.length > 0) return fallbackFiles;
+    throw rejected.reason;
+  }
+  const files = results.flatMap((result) => (result.status === 'fulfilled' ? result.value : []));
+  return files.length > 0 ? files : fallbackFiles;
 }
 
 async function filesFromDataTransferItem(item: DataTransferItem): Promise<File[]> {
@@ -1509,11 +1814,19 @@ async function filesFromFileSystemEntry(entry: FileSystemEntry): Promise<File[]>
 }
 
 function fileFromEntry(entry: FileSystemFileEntryWithFile): Promise<File> {
-  return new Promise((resolve, reject) => entry.file(resolve, reject));
+  return new Promise((resolve, reject) => {
+    entry.file(resolve, (error) => {
+      reject(createFileSystemReadError('Could not read dropped file', error));
+    });
+  });
 }
 
 function readEntryBatch(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
-  return new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+  return new Promise((resolve, reject) => {
+    reader.readEntries(resolve, (error) => {
+      reject(createFileSystemReadError('Could not read dropped folder', error));
+    });
+  });
 }
 
 function kindGlyph(kind: ProjectFileKind): string {

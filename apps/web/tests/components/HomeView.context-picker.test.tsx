@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_UNSELECTED_SCENARIO_PLUGIN_ID,
   type InstalledPluginRecord,
+  type ConnectorDetail,
+  type McpServerConfig,
   type SkillSummary,
 } from '@open-design/contracts';
 import { HomeView } from '../../src/components/HomeView';
@@ -22,6 +24,33 @@ const SKILL: SkillSummary = {
   hasBody: true,
   examplePrompt: 'Design a focused onboarding prototype.',
   aggregatesExamples: false,
+};
+
+const DECK_SKILL: SkillSummary = {
+  ...SKILL,
+  id: 'deck-lab',
+  name: 'Deck Lab',
+  description: 'Create a focused slide deck.',
+  triggers: ['deck', 'slides'],
+  mode: 'deck',
+  examplePrompt: 'Design a focused investor deck.',
+};
+
+const WEB_PROTOTYPE_PLUGIN = makePlugin('example-web-prototype', 'Web Prototype');
+const MCP_SERVER: McpServerConfig = {
+  id: 'linear',
+  label: 'Linear',
+  transport: 'stdio',
+  enabled: true,
+  command: 'npx',
+};
+const CONNECTOR: ConnectorDetail = {
+  id: 'slack',
+  name: 'Slack',
+  provider: 'Composio',
+  category: 'Communication',
+  status: 'connected',
+  tools: [],
 };
 
 function makePlugin(id: string, title: string): InstalledPluginRecord {
@@ -232,6 +261,201 @@ describe('HomeView context picker', () => {
       pluginId: DEFAULT_UNSELECTED_SCENARIO_PLUGIN_ID,
       skillId: SKILL.id,
       projectKind: 'prototype',
+    }));
+  });
+
+  it('clears an active type chip when the user picks a skill (#2972)', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (url) => {
+      if (typeof url === 'string' && url === '/api/plugins') {
+        return new Response(JSON.stringify({ plugins: [WEB_PROTOTYPE_PLUGIN] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (typeof url === 'string' && url === '/api/mcp/servers') {
+        return new Response(JSON.stringify({ servers: [], templates: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      cb(0);
+      return 0;
+    });
+    const onSubmit = vi.fn();
+
+    render(
+      <HomeView
+        projects={[]}
+        skills={[DECK_SKILL, SKILL]}
+        onSubmit={onSubmit}
+        onOpenProject={() => undefined}
+        onViewAllProjects={() => undefined}
+      />,
+    );
+
+    fireEvent.click(await screen.findByTestId('home-hero-rail-prototype'));
+    await waitFor(() => {
+      expect(screen.getByTestId('home-hero-active-type-chip').textContent).toContain('Prototype');
+    });
+
+    const input = screen.getByTestId('home-hero-input');
+    fireEvent.change(input, { target: { value: '@deck' } });
+    fireEvent.mouseDown(screen.getByRole('option', { name: /deck lab/i }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('home-hero-active-skill')).toBeTruthy();
+      expect(screen.queryByTestId('home-hero-active-type-chip')).toBeNull();
+    });
+
+    fireEvent.click(screen.getByTestId('home-hero-submit'));
+
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      pluginId: DEFAULT_UNSELECTED_SCENARIO_PLUGIN_ID,
+      skillId: DECK_SKILL.id,
+      projectKind: 'deck',
+    }));
+    expect(onSubmit.mock.calls[0]?.[0]?.pluginId).not.toBe('example-web-prototype');
+  });
+
+  it('clears an active skill when the user picks a type chip (#2972)', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (url) => {
+      if (typeof url === 'string' && url === '/api/plugins') {
+        return new Response(JSON.stringify({ plugins: [WEB_PROTOTYPE_PLUGIN] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (typeof url === 'string' && url.includes('/apply')) {
+        return new Response(JSON.stringify({
+          appliedPlugin: {
+            snapshotId: 'snap-web-prototype',
+            pluginId: 'example-web-prototype',
+            pluginVersion: '1.0.0',
+            inputs: {},
+          },
+          contextItems: [],
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (typeof url === 'string' && url === '/api/mcp/servers') {
+        return new Response(JSON.stringify({ servers: [], templates: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      cb(0);
+      return 0;
+    });
+    const onSubmit = vi.fn();
+
+    render(
+      <HomeView
+        projects={[]}
+        skills={[SKILL]}
+        onSubmit={onSubmit}
+        onOpenProject={() => undefined}
+        onViewAllProjects={() => undefined}
+      />,
+    );
+
+    const input = await screen.findByTestId('home-hero-input');
+    fireEvent.change(input, { target: { value: '@proto' } });
+    fireEvent.mouseDown(screen.getByRole('option', { name: /prototype lab/i }));
+    await waitFor(() => {
+      expect(screen.getByTestId('home-hero-active-skill')).toBeTruthy();
+    });
+
+    fireEvent.click(await screen.findByTestId('home-hero-rail-prototype'));
+    await waitFor(() => {
+      expect(screen.getByTestId('home-hero-active-type-chip').textContent).toContain('Prototype');
+      expect(screen.queryByTestId('home-hero-active-skill')).toBeNull();
+    });
+
+    fireEvent.change(input, { target: { value: 'Build a pricing-page prototype.' } });
+    fireEvent.click(screen.getByTestId('home-hero-submit'));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      pluginId: 'example-web-prototype',
+      skillId: null,
+      projectKind: 'prototype',
+    })));
+  });
+
+  it('submits selected MCP servers and connectors as first-turn context', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (url) => {
+      if (typeof url === 'string' && url === '/api/plugins') {
+        return new Response(JSON.stringify({ plugins: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (typeof url === 'string' && url === '/api/mcp/servers') {
+        return new Response(JSON.stringify({ servers: [MCP_SERVER], templates: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      cb(0);
+      return 0;
+    });
+    const onSubmit = vi.fn();
+
+    render(
+      <HomeView
+        projects={[]}
+        connectors={[CONNECTOR]}
+        onSubmit={onSubmit}
+        onOpenProject={() => undefined}
+        onViewAllProjects={() => undefined}
+      />,
+    );
+
+    const input = await screen.findByTestId('home-hero-input');
+    fireEvent.change(input, { target: { value: '@lin' } });
+    fireEvent.mouseDown(screen.getByRole('option', { name: /linear/i }));
+
+    await waitFor(() => {
+      expect((input as HTMLTextAreaElement).value).toBe('@Linear');
+    });
+
+    fireEvent.change(input, { target: { value: '@Linear @sla' } });
+    fireEvent.mouseDown(screen.getByRole('option', { name: /slack/i }));
+
+    await waitFor(() => {
+      expect((input as HTMLTextAreaElement).value).toBe('@Linear @Slack');
+    });
+
+    fireEvent.click(screen.getByTestId('home-hero-submit'));
+
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: '@Linear @Slack',
+      pluginId: DEFAULT_UNSELECTED_SCENARIO_PLUGIN_ID,
+      contextMcpServers: [
+        expect.objectContaining({ id: 'linear', label: 'Linear', transport: 'stdio' }),
+      ],
+      contextConnectors: [
+        expect.objectContaining({
+          id: 'slack',
+          name: 'Slack',
+          provider: 'Composio',
+          category: 'Communication',
+          status: 'connected',
+        }),
+      ],
     }));
   });
 });

@@ -25,13 +25,18 @@
   padding: 32px 0 8px;
 }
 .home-hero__brand {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  justify-content: center;
   color: var(--text-muted);
   font-size: 13px;
 }
 .home-hero__brand-mark {
+  position: absolute;
+  top: 50%;
+  right: calc(100% + 8px);
+  transform: translateY(-50%);
   width: 26px;
   height: 26px;
   border-radius: 50%;
@@ -258,7 +263,7 @@
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
   padding: 14px 14px 10px;
   display: flex;
   flex-direction: column;
@@ -266,13 +271,17 @@
   margin-top: 0;
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
+.home-hero__input-card--compact-authoring {
+  max-width: 640px;
+  padding-block: 12px 10px;
+}
 .home-hero__input-card:focus-within {
   border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
-  box-shadow: var(--shadow-md);
+  box-shadow: none;
 }
 .home-hero__input-card.is-drag-active {
   border-color: color-mix(in srgb, var(--accent) 56%, var(--border));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent), var(--shadow-md);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
 }
 .home-hero__active {
   display: flex;
@@ -369,6 +378,28 @@
   min-width: 0;
   max-height: var(--home-hero-prompt-max-height);
   overflow: hidden;
+  --home-hero-prompt-font-size: 15px;
+  --home-hero-prompt-line-height: 1.85;
+  --home-hero-prompt-padding: 6px 6px;
+}
+.home-hero__prompt-highlight,
+.home-hero__input {
+  font: inherit;
+  font-size: var(--home-hero-prompt-font-size);
+  font-weight: inherit;
+  line-height: var(--home-hero-prompt-line-height);
+  letter-spacing: normal;
+  word-spacing: normal;
+  font-kerning: auto;
+  font-feature-settings: normal;
+  font-variant-ligatures: normal;
+  text-rendering: auto;
+  tab-size: 4;
+  padding: var(--home-hero-prompt-padding);
+  box-sizing: border-box;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-align: start;
 }
 .home-hero__prompt-highlight {
   position: absolute;
@@ -376,10 +407,7 @@
   z-index: auto;
   overflow: hidden;
   max-height: var(--home-hero-prompt-max-height);
-  padding: 0;
   color: var(--text);
-  font: inherit;
-  font-size: 15px;
   /* Generous line-height so adjacent slot/mention pills do not
      collide vertically when the prompt wraps. Each pill paints a
      2px ring via `box-shadow`; with a tight line-height the rings
@@ -387,15 +415,12 @@
      Bumping the line-height leaves ~8px of clear space between
      pill rows. The textarea below mirrors this value so the
      overlay and the editable text stay pixel-aligned. */
-  line-height: 1.85;
   pointer-events: none;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 .home-hero__prompt-highlight-inner {
+  position: relative;
+  top: calc(-1 * var(--home-hero-prompt-scroll, 0px));
   min-height: 100%;
-  padding: 6px;
-  transform: translateY(calc(-1 * var(--home-hero-prompt-scroll, 0px)));
 }
 .home-hero__prompt-slot {
   display: inline;
@@ -534,12 +559,6 @@
      HomeHero.tsx, which writes an explicit pixel height after every
      keystroke. Keep the native resize grip disabled while allowing
      the effect to toggle internal scrolling for very long prompts. */
-  font: inherit;
-  font-size: 15px;
-  /* Must match `.home-hero__prompt-highlight` so the editable
-     textarea and the highlight overlay wrap identically. */
-  line-height: 1.85;
-  padding: 6px 6px;
   border: none;
   outline: none;
   background: transparent;
@@ -852,7 +871,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  border-top: 1px dashed var(--border-soft);
+  border-top: 0;
   padding-top: 8px;
 }
 .home-hero__attachments {
@@ -1258,7 +1277,7 @@
   padding: 6px;
   border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
   border-radius: 13px;
-  background: #fff;
+  background: color-mix(in srgb, var(--bg-panel) 98%, var(--bg-subtle) 2%);
   box-shadow: 0 18px 44px rgba(15, 23, 42, 0.16), 0 1px 2px rgba(15, 23, 42, 0.08);
   isolation: isolate;
 }
@@ -1285,7 +1304,7 @@
   top: 0;
   z-index: 1;
   padding-bottom: 8px;
-  background: #fff;
+  background: color-mix(in srgb, var(--bg-panel) 98%, var(--bg-subtle) 2%);
 }
 .home-hero__footer-option--select[data-field-name='designSystem'] .home-hero__footer-select-search {
   margin: 0;
@@ -1297,7 +1316,7 @@
   height: 42px;
   border: 1px solid color-mix(in srgb, var(--border) 90%, transparent);
   border-radius: 10px;
-  background: #fff;
+  background: var(--bg-panel);
   color: var(--text);
   font: inherit;
   font-size: 14px;
@@ -1321,7 +1340,7 @@
 .home-hero__footer-select-search input:focus {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
-  background: #fff;
+  background: var(--bg-panel);
 }
 .home-hero__footer-option--select[data-field-name='designSystem'] .home-hero__footer-select-search input:focus {
   border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
@@ -1611,6 +1630,22 @@
 .home-hero__model-option-icon--custom {
   color: var(--text-muted);
 }
+[data-theme="dark"] .home-hero__model-option-icon--openai img,
+[data-theme="dark"] .home-hero__model-option-icon--dalle img,
+[data-theme="dark"] .home-hero__model-option-icon--grok img,
+[data-theme="dark"] .home-hero__model-option-icon--elevenlabs img,
+[data-theme="dark"] .home-hero__model-option-icon--suno img {
+  filter: invert(1) brightness(1.2);
+}
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) .home-hero__model-option-icon--openai img,
+  html:not([data-theme="light"]) .home-hero__model-option-icon--dalle img,
+  html:not([data-theme="light"]) .home-hero__model-option-icon--grok img,
+  html:not([data-theme="light"]) .home-hero__model-option-icon--elevenlabs img,
+  html:not([data-theme="light"]) .home-hero__model-option-icon--suno img {
+    filter: invert(1) brightness(1.2);
+  }
+}
 .home-hero__ratio-option-icon {
   width: 26px;
   height: 26px;
@@ -1815,11 +1850,8 @@
   appearance: none;
   min-width: 0;
   min-height: 112px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-rows: minmax(0, 1fr) auto;
-  align-items: start;
-  gap: 8px;
+  display: flex;
+  align-items: flex-start;
   padding: 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -1839,18 +1871,8 @@
     box-shadow 140ms ease;
 }
 .home-hero__prompt-example span {
-  grid-column: 1 / -1;
-  align-self: start;
   min-width: 0;
   overflow-wrap: anywhere;
-}
-.home-hero__prompt-example svg {
-  grid-column: 2;
-  grid-row: 2;
-  align-self: end;
-  justify-self: end;
-  color: var(--text-faint);
-  transition: color 140ms ease, transform 140ms ease;
 }
 .home-hero__prompt-example:hover,
 .home-hero__prompt-example:focus-visible {
@@ -1860,11 +1882,6 @@
   color: var(--text-strong);
   transform: translateY(-1px);
   box-shadow: var(--shadow-sm);
-}
-.home-hero__prompt-example:hover svg,
-.home-hero__prompt-example:focus-visible svg {
-  color: var(--accent);
-  transform: translate(1px, -1px);
 }
 
 .home-hero__plugin-presets-wrap {

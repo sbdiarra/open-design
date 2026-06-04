@@ -502,7 +502,10 @@ winDescribe('packaged windows runtime smoke', () => {
         started = false;
         expect(reinstall.code).toBe(0);
         expect(reinstall.nsisLogTail.join('\n')).toContain('running instances detected before silent install');
-        expect(reinstall.nsisLogTail.join('\n')).toContain('running instances close exit=0');
+        // The installer closes running instances via pwsh.exe, falling back to
+        // powershell.exe (#2799), so the log reads "running instances close via
+        // <shell>.exe exit=0" rather than the older "running instances close exit=0".
+        expect(reinstall.nsisLogTail.join('\n')).toMatch(/running instances close via (?:pwsh|powershell)\.exe exit=0/);
 
         start = await measureSmokeStep(timings, 'restart after direct reinstall', async () =>
           runToolsPackJson<WinStartResult>('start'),

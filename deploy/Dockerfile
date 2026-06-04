@@ -70,6 +70,18 @@ RUN NODE_OPTIONS=${OD_BUILD_NODE_OPTIONS} pnpm --filter @open-design/daemon buil
       -name "binding.gyp" \
     \) -delete
 
+# Stage-2 assets — copied into the build stage so the runtime stage
+# can pull them via --from=build instead of reaching back into the
+# build context.  This lets the Dockerfile work when the build context
+# differs from the repo root (Railway, CI runners with a subdirectory
+# context, etc.).
+COPY skills ./skills
+COPY design-systems ./design-systems
+COPY craft ./craft
+COPY prompt-templates ./prompt-templates
+COPY assets ./assets
+COPY plugins/_official ./plugins/_official
+
 FROM ${RUNTIME_IMAGE}
 
 ARG INSTALL_KILO_CLI=true
@@ -97,20 +109,31 @@ RUN apk add --no-cache \
     if [ "${INSTALL_KILO_CLI}" = "true" ]; then npm install -g @kilocode/cli; fi
 
 WORKDIR /app
+
 COPY --from=build --chown=node:node /app/deploy/daemon ./apps/daemon
 COPY --from=build --chown=node:node /app/apps/web/out ./apps/web/out
-COPY --chown=node:node skills ./skills
-COPY --chown=node:node design-systems ./design-systems
-COPY --chown=node:node craft ./craft
-COPY --chown=node:node prompt-templates ./prompt-templates
-COPY --chown=node:node assets/frames ./assets/frames
-COPY --chown=node:node assets/community-pets ./assets/community-pets
+COPY --from=build --chown=node:node /app/apps/skills ./skills
+COPY --from=build --chown=node:node /app/design-systems ./design-systems
+COPY --from=build --chown=node:node /app/craft ./craft
+COPY --from=build --chown=node:node /app/prompt-templates ./prompt-templates
+COPY --from=build --chown=node:node /app/assets/frames ./assets/frames
+COPY --from=build --chown=node:node /app/assets/community-pets ./assets/community-pets
+
+# COPY --from=build --chown=open-design:open-design /app/deploy/daemon ./apps/daemon
+# COPY --from=build --chown=open-design:open-design /app/apps/web/out ./apps/web/out
+# COPY --from=build --chown=open-design:open-design /app/skills ./skills
+# COPY --from=build --chown=open-design:open-design /app/design-systems ./design-systems
+# COPY --from=build --chown=open-design:open-design /app/craft ./craft
+# COPY --from=build --chown=open-design:open-design /app/prompt-templates ./prompt-templates
+# COPY --from=build --chown=open-design:open-design /app/assets/frames ./assets/frames
+# COPY --from=build --chown=open-design:open-design /app/assets/community-pets ./assets/community-pets
 # Plan §3.J4 / spec §23.3.5 — bundled atom plugins registered on
 # daemon boot. The directory contains `plugins/_official/atoms/<atom>/`
 # pairs (SKILL.md + open-design.json); registerBundledPlugins() walks
 # it on startup so the container ships with first-party atoms reachable
 # via the same registry path third-party plugins use.
-COPY --chown=node:node plugins/_official ./plugins/_official
+COPY --from=build --chown=node:node /app/plugins/_official ./plugins/_official
+# COPY --from=build --chown=open-design:open-design /app/plugins/_official ./plugins/_official
 
 # Initialise a minimal git repository at /app so Kilo/OpenCode can resolve a
 # real project root when spawned with a cwd under /app/.od/projects/.

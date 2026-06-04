@@ -53,6 +53,7 @@ export async function getProject(id: string): Promise<Project | null> {
 
 export async function createProject(input: {
   name: string;
+  projectLocationId?: string;
   skillId: string | null;
   designSystemId: string | null;
   pendingPrompt?: string;
@@ -109,23 +110,28 @@ export async function importFolderProject(
 
 export async function importClaudeDesignZip(
   file: File,
-): Promise<{ project: Project; conversationId: string; entryFile: string } | null> {
-  try {
-    const form = new FormData();
-    form.append('file', file);
-    const resp = await fetch('/api/import/claude-design', {
-      method: 'POST',
-      body: form,
-    });
-    if (!resp.ok) return null;
-    return (await resp.json()) as {
-      project: Project;
-      conversationId: string;
-      entryFile: string;
-    };
-  } catch {
-    return null;
+): Promise<{ project: Project; conversationId: string; entryFile: string }> {
+  const form = new FormData();
+  form.append('file', file);
+  const resp = await fetch('/api/import/claude-design', {
+    method: 'POST',
+    body: form,
+  });
+  if (!resp.ok) {
+    const payload = await resp.json().catch(() => null);
+    const message =
+      payload != null &&
+      typeof payload === 'object' &&
+      typeof (payload as { error?: unknown }).error === 'string'
+        ? (payload as { error: string }).error
+        : `Import failed (${resp.status})`;
+    throw new Error(message);
   }
+  return (await resp.json()) as {
+    project: Project;
+    conversationId: string;
+    entryFile: string;
+  };
 }
 
 // ---------- templates ----------
@@ -311,6 +317,11 @@ export async function listMessages(
 
 export interface SaveMessageOptions {
   telemetryFinalized?: boolean;
+  // Set during page-unload paths (pagehide / visibilitychange→hidden) so
+  // the in-flight PUT survives even if the document tears down before the
+  // response arrives. Without keepalive the browser cancels the fetch
+  // and the daemon never sees the final buffered text chunk.
+  keepalive?: boolean;
 }
 
 export async function saveMessage(
@@ -329,6 +340,7 @@ export async function saveMessage(
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        ...(options.keepalive ? { keepalive: true } : {}),
       },
     );
   } catch {

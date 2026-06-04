@@ -10,7 +10,7 @@
  */
 import { useState } from 'react';
 import { useT } from '../i18n';
-import { parseTodoWriteInput } from '../runtime/todos';
+import { isTodoWriteToolName, parseTodoWriteInput } from '../runtime/todos';
 import { getToolRenderer, toRenderProps } from '../runtime/tool-renderers';
 import type { AgentEvent } from '../types';
 
@@ -89,7 +89,7 @@ export function ToolCard({
         onAnswerToolUse={onAnswerToolUse}
       />
     );
-  if (name === 'TodoWrite' || name === 'todowrite') return <TodoCard input={use.input} runStreaming={isStreaming} runSucceeded={isSucceeded} />;
+  if (isTodoWriteToolName(name)) return <TodoCard input={use.input} runStreaming={isStreaming} runSucceeded={isSucceeded} />;
   if (name === 'Write' || name === 'write' || name === 'create_file')
     return <FileWriteCard input={use.input} result={result} runStreaming={isStreaming} runSucceeded={isSucceeded} ctx={ctx} />;
   if (name === 'Edit' || name === 'str_replace_edit')
@@ -498,6 +498,7 @@ function FileWriteCard({
         <ResultBadge result={result} runStreaming={runStreaming} runSucceeded={runSucceeded} />
         <OpenInTabButton filePath={file} ctx={ctx} />
       </div>
+      <FileErrorDetail result={result} />
     </div>
   );
 }
@@ -538,6 +539,7 @@ function FileEditCard({
         <ResultBadge result={result} runStreaming={runStreaming} runSucceeded={runSucceeded} />
         <OpenInTabButton filePath={file} ctx={ctx} />
       </div>
+      <FileErrorDetail result={result} />
     </div>
   );
 }
@@ -567,6 +569,7 @@ function FileReadCard({
         <ResultBadge result={result} runStreaming={runStreaming} runSucceeded={runSucceeded} />
         <OpenInTabButton filePath={file} ctx={ctx} />
       </div>
+      <FileErrorDetail result={result} />
     </div>
   );
 }
@@ -696,8 +699,13 @@ function ResultBadge({ result, runStreaming, runSucceeded }: { result?: Props['r
   const t = useT();
   if (!result && runStreaming) return <span className="op-status op-status-running">{t('tool.running')}</span>;
   if (!result && !runSucceeded) return <span className="op-status op-status-error">{t('tool.error')}</span>;
-  if (result?.isError) return <span className="op-status op-status-error">{t('tool.error')}</span>;
+  if (result?.isError) return <span className="op-status op-status-error" title={result.content}>{t('tool.error')}</span>;
   return <span className="op-status op-status-ok">{t('tool.done')}</span>;
+}
+
+function FileErrorDetail({ result }: { result?: Props['result'] }) {
+  if (!result?.isError || !result.content.trim()) return null;
+  return <pre className="op-output">{truncate(result.content, 1200)}</pre>;
 }
 
 function describeInput(input: unknown): string {

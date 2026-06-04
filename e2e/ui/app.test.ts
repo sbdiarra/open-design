@@ -1,5 +1,9 @@
 import { expect, test } from '@playwright/test';
 import type { Dialog, Page, Request, Response } from '@playwright/test';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { T } from '@/timeouts';
 import { automatedUiScenarios } from '@/playwright/resources';
 import type { UiScenario } from '@/playwright/resources';
 
@@ -375,6 +379,100 @@ for (const entry of automatedUiScenarios().filter(
   });
 }
 
+test('sending preview comments keeps the preview live and refreshes it with the follow-up artifact', async ({ page }) => {
+  const entry = automatedUiScenarios().find((scenario) => scenario.id === 'comment-attachment-flow');
+  if (!entry?.mockArtifact) {
+    throw new Error('comment-attachment-flow scenario fixture is missing');
+  }
+
+  await routeMockAgents(page);
+
+  let requestCount = 0;
+  await page.route('**/api/runs', async (route) => {
+    requestCount += 1;
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ runId: `mock-run-${requestCount}` }),
+    });
+  });
+  await page.route('**/api/runs/*/events', async (route) => {
+    const revisedHtml =
+      '<!doctype html><html><body><main data-od-id="hero-section">' +
+      '<h1 data-od-id="hero-title" data-screen-label="Hero title">Revised headline</h1>' +
+      '<p data-od-id="hero-copy">Preview copy refreshed after comment send.</p>' +
+      '</main></body></html>';
+    const artifactTitle = requestCount === 1 ? entry.mockArtifact!.title : 'Commentable Artifact Revised';
+    const artifactHtml = requestCount === 1 ? entry.mockArtifact!.html : revisedHtml;
+    const body = [
+      'event: start',
+      'data: {"bin":"mock-agent"}',
+      '',
+      'event: stdout',
+      `data: ${JSON.stringify({
+        chunk:
+          `<artifact identifier="${entry.mockArtifact!.identifier}" type="text/html" title="${artifactTitle}">` +
+          artifactHtml +
+          '</artifact>',
+      })}`,
+      '',
+      'event: end',
+      'data: {"code":0,"status":"succeeded"}',
+      '',
+      '',
+    ].join('\n');
+
+    await route.fulfill({
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+      },
+      body,
+    });
+  });
+
+  await gotoEntryHome(page);
+  await createProject(page, entry);
+  await expectWorkspaceReady(page);
+
+  await sendPrompt(page, entry.prompt);
+  await expectArtifactVisible(page, entry);
+
+  await page.getByTestId('board-mode-toggle').click();
+  await page.getByTestId('comment-panel-toggle').click();
+  const frame = page.frameLocator('[data-testid="artifact-preview-frame"]');
+  await frame.locator('[data-od-id="hero-title"]').click();
+  await expect(page.getByTestId('comment-popover')).toBeVisible();
+  await page.getByTestId('comment-popover-input').fill('Make the headline more specific.');
+  await page.getByTestId('comment-popover-save').click();
+  await expect(page.getByTestId('comment-saved-marker-hero-title')).toBeVisible();
+
+  const sidePanel = page.getByTestId('comment-side-panel');
+  await expect(sidePanel).toBeVisible();
+  await sidePanel.getByTestId('comment-side-item').filter({ hasText: 'Make the headline more specific.' })
+    .getByRole('button', { name: 'Select' })
+    .click();
+  await expect(page.getByTestId('comment-side-send-claude')).toBeVisible();
+
+  const runRequest = page.waitForRequest(isCreateRunRequest);
+  await page.getByTestId('comment-side-send-claude').click();
+  const body = (await runRequest).postDataJSON() as {
+    commentAttachments?: Array<{ elementId?: string; comment?: string; filePath?: string }>;
+  };
+  expect(body.commentAttachments).toEqual([
+    expect.objectContaining({
+      elementId: 'hero-title',
+      comment: 'Make the headline more specific.',
+      filePath: 'commentable-artifact.html',
+    }),
+  ]);
+
+  await expect(page.getByTestId('artifact-preview-frame')).toBeVisible();
+  await expect(frame.getByRole('heading', { name: 'Revised headline' })).toBeVisible();
+  await expect(frame.getByText('Preview copy refreshed after comment send.')).toBeVisible();
+});
+
 async function routeMockAgents(page: Page) {
   await page.route('**/api/agents', async (route) => {
     await route.fulfill({
@@ -546,45 +644,18 @@ async function expectProjectShellReady(page: Page) {
   await expect(page.getByTestId('file-workspace')).toBeVisible();
 }
 
-async function sendPrompt(
-  page: Page,
-  prompt: string,
-) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const input = page.getByTestId('chat-composer-input');
-    const sendButton = page.getByTestId('chat-send');
-    await expect(input).toBeVisible({ timeout: 3_000 });
-    await input.click();
-    await input.fill(prompt);
-    try {
-      await expect(input).toHaveValue(prompt, { timeout: 1500 });
-      await expect(sendButton).toBeEnabled({ timeout: 1500 });
-      await Promise.all([
-        page.waitForResponse(isCreateRunResponse, { timeout: 5_000 }),
-        sendButton.evaluate((button: HTMLButtonElement) => button.click()),
-      ]);
-      return;
-    } catch (error) {
-      const retryInput = page.getByTestId('chat-composer-input');
-      const retrySendButton = page.getByTestId('chat-send');
-      await expect(retryInput).toBeVisible({ timeout: 3_000 });
-      await retryInput.click();
-      await retryInput.press(`${process.platform === 'darwin' ? 'Meta' : 'Control'}+A`);
-      await retryInput.press('Backspace');
-      await retryInput.pressSequentially(prompt);
-      try {
-        await expect(retryInput).toHaveValue(prompt, { timeout: 1500 });
-        await expect(retrySendButton).toBeEnabled({ timeout: 1500 });
-        await Promise.all([
-          page.waitForResponse(isCreateRunResponse, { timeout: 5_000 }),
-          retrySendButton.evaluate((button: HTMLButtonElement) => button.click()),
-        ]);
-        return;
-      } catch (retryError) {
-        if (attempt === 2) throw retryError;
-      }
-    }
-  }
+async function sendPrompt(page: Page, prompt: string) {
+  const input = page.getByTestId('chat-composer-input');
+  const sendButton = page.getByTestId('chat-send');
+  await expect(input).toBeVisible({ timeout: T.short });
+  await input.click();
+  await input.fill(prompt);
+  await expect(input).toHaveValue(prompt, { timeout: T.short });
+  await expect(sendButton).toBeEnabled({ timeout: T.short });
+  await Promise.all([
+    page.waitForResponse(isCreateRunResponse, { timeout: 5_000 }),
+    sendButton.evaluate((button: HTMLButtonElement) => button.click()),
+  ]);
 }
 
 function isCreateRunResponse(resp: Response): boolean {
@@ -893,7 +964,7 @@ async function runCommentAttachmentFlow(
   await expectArtifactVisible(page, entry);
 
   await page.getByTestId('board-mode-toggle').click();
-  await page.getByTestId('comment-mode-toggle').click();
+  await page.getByTestId('comment-panel-toggle').click();
   const frame = page.frameLocator('[data-testid="artifact-preview-frame"]');
   await frame.locator('[data-od-id="hero-title"]').click();
   await expect(page.getByTestId('comment-popover')).toBeVisible();
@@ -1055,7 +1126,7 @@ async function gotoEntryHome(page: Page) {
   await page.goto('/', { waitUntil: 'domcontentloaded' });
   await waitForLoadingToClear(page);
   const privacyDialog = page.getByRole('dialog').filter({ hasText: 'Help us improve Open Design' });
-  if (await privacyDialog.isVisible().catch(() => false)) {
+  if (await privacyDialog.isVisible()) {
     await privacyDialog.getByRole('button', { name: /not now/i }).click();
     await expect(privacyDialog).toHaveCount(0);
   }
@@ -1070,8 +1141,7 @@ async function openNewProjectModal(page: Page) {
 }
 
 async function waitForLoadingToClear(page: Page) {
-  const loading = page.getByText('Loading Open Design…');
-  await loading.waitFor({ state: 'detached', timeout: 10_000 }).catch(() => {});
+  await page.getByText('Loading Open Design…').waitFor({ state: 'hidden', timeout: T.medium });
 }
 
 async function getCurrentProjectContext(

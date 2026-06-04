@@ -2,7 +2,7 @@
 // and live artifact refreshers. The daemon still stores these as routines;
 // the UI presents them as scheduled agent conversations.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AutomationEvolutionProposal,
   AutomationEvolutionProposalListResponse,
@@ -368,6 +368,8 @@ export function TasksView({ skills = [], designTemplates = [], connectors = [] }
   const [proposalBusyId, setProposalBusyId] = useState<string | null>(null);
   const [crystallizingRunId, setCrystallizingRunId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [focusRoutineId, setFocusRoutineId] = useState<string | null>(null);
+  const routineRowRefs = useRef<Record<string, HTMLLIElement | null>>({});
   const [historyTick, setHistoryTick] = useState(0);
 
   const templates = useMemo(
@@ -435,8 +437,22 @@ export function TasksView({ skills = [], designTemplates = [], connectors = [] }
     return map;
   }, [projects]);
 
-  const activeCount = routines.filter((routine) => routine.enabled).length;
-  const pausedCount = routines.length - activeCount;
+  // Sort routines by creation time, newest first
+  const sortedRoutines = useMemo(
+    () => sortRoutinesNewestFirst(routines),
+    [routines],
+  );
+
+  useEffect(() => {
+    if (!focusRoutineId) return;
+    const node = routineRowRefs.current[focusRoutineId];
+    node?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    const timer = window.setTimeout(() => setFocusRoutineId(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [focusRoutineId, sortedRoutines]);
+
+  const activeCount = sortedRoutines.filter((routine) => routine.enabled).length;
+  const pausedCount = sortedRoutines.length - activeCount;
 
   const reviewProposal = async (id: string, action: 'apply' | 'reject') => {
     setProposalBusyId(id);
@@ -587,7 +603,7 @@ export function TasksView({ skills = [], designTemplates = [], connectors = [] }
           <h2 className="automations-section__label">Your automations</h2>
           {loading ? <span className="automations-section__meta">Loading</span> : null}
         </div>
-        {!loading && routines.length === 0 ? (
+        {!loading && sortedRoutines.length === 0 ? (
           <button
             type="button"
             className="automation-empty"
@@ -602,9 +618,9 @@ export function TasksView({ skills = [], designTemplates = [], connectors = [] }
             </span>
           </button>
         ) : null}
-        {routines.length > 0 ? (
+        {sortedRoutines.length > 0 ? (
           <ul className="automations-saved__list">
-            {routines.map((r) => {
+            {sortedRoutines.map((r) => {
               const isBusy = busyId === r.id;
               const targetLabel =
                 r.target.mode === 'reuse'
@@ -614,7 +630,11 @@ export function TasksView({ skills = [], designTemplates = [], connectors = [] }
               return (
                 <li
                   key={r.id}
-                  className={`automation-row${r.enabled ? '' : ' is-paused'}`}
+                  ref={(node) => {
+                    routineRowRefs.current[r.id] = node;
+                  }}
+                  data-testid={`automation-row-${r.id}`}
+                  className={`automation-row${r.enabled ? '' : ' is-paused'}${focusRoutineId === r.id ? ' is-focused' : ''}`}
                 >
                   <div className="automation-row__main">
                     <span className="automation-row__icon">
@@ -876,12 +896,20 @@ export function TasksView({ skills = [], designTemplates = [], connectors = [] }
         skills={skills}
         connectors={connectors}
         onClose={() => setModal(null)}
-        onSaved={() => {
-          void refresh();
+        onSaved={(routine) => {
+          void (async () => {
+            await refresh();
+            setExpandedId(routine.id);
+            setFocusRoutineId(routine.id);
+          })();
         }}
       />
     </section>
   );
+}
+
+export function sortRoutinesNewestFirst(routines: Routine[]): Routine[] {
+  return [...routines].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
 }
 
 function Metric({ label, value }: { label: string; value: number }) {

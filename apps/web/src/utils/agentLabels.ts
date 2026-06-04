@@ -1,15 +1,18 @@
 const AGENT_LABELS: Record<string, string> = {
+  aider: 'Aider',
   claude: 'Claude',
   codex: 'Codex',
   devin: 'Devin',
   gemini: 'Gemini',
   opencode: 'OpenCode',
+  amr: 'AMR',
   'cursor-agent': 'Cursor',
   cursor: 'Cursor',
   qwen: 'Qwen',
   qoder: 'Qoder',
   copilot: 'Copilot',
   deepseek: 'DeepSeek',
+  antigravity: 'Antigravity',
   'anthropic-api': 'Anthropic API',
   'openai-api': 'OpenAI API',
   'azure-openai-api': 'Azure OpenAI',
@@ -28,6 +31,9 @@ const AGENT_ALIASES: Record<string, string> = {
   'github copilot cli': 'copilot',
   'deepseek tui': 'deepseek',
   'deepseek-tui': 'deepseek',
+  'aider cli': 'aider',
+  'aider chat': 'aider',
+  agy: 'antigravity',
 };
 
 export function agentDisplayName(

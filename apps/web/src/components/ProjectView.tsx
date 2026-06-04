@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -12,10 +13,11 @@ import { createHtmlArtifactManifest, inferLegacyManifest } from '../artifacts/ma
 import { resolveHtmlPointerArtifactTarget } from '../artifacts/pointer';
 import { validateHtmlArtifact } from '../artifacts/validate';
 import { createArtifactParser } from '../artifacts/parser';
-import { useT } from '../i18n';
+import { useI18n } from '../i18n';
 import { streamMessage } from '../providers/anthropic';
 import {
   fetchChatRunStatus,
+  fetchVelaLoginStatus,
   listActiveChatRuns,
   listProjectRuns,
   reattachDaemonRun,
@@ -26,6 +28,7 @@ import { fetchElevenLabsVoiceOptions } from '../providers/elevenlabs-voices';
 import { normalizeCustomReason } from '@open-design/contracts/analytics';
 import {
   deletePreviewComment,
+  fetchConnectorStatuses,
   fetchPreviewComments,
   fetchDesignSystem,
   fetchDesignTemplate,
@@ -34,6 +37,7 @@ import {
   fetchProjectFiles,
   fetchSkill,
   patchPreviewCommentStatus,
+  projectRawUrl,
   upsertPreviewComment,
   writeProjectTextFile,
 } from '../providers/registry';
@@ -70,6 +74,7 @@ import {
 import {
   apiProtocolAgentId,
   apiProtocolModelLabel,
+  usesAnthropicProxy,
 } from '../utils/apiProtocol';
 import { playSound, showCompletionNotification } from '../utils/notifications';
 import { randomUUID } from '../utils/uuid';
@@ -132,9 +137,11 @@ import {
   mergeAttachedComments,
   removeAttachedComment,
 } from '../comments';
-import { AppChromeHeader } from './AppChromeHeader';
+import { filterImplicitProducedFiles } from '../produced-files';
+import { buildPptxExportPrompt } from '../lib/build-pptx-export-prompt';
 import { AvatarMenu } from './AvatarMenu';
 import { HandoffButton } from './HandoffButton';
+import { Icon } from './Icon';
 import { ProjectDesignSystemPicker } from './ProjectDesignSystemPicker';
 import { ChatPane } from './ChatPane';
 import type { ChatSendMeta } from './ChatComposer';
@@ -142,13 +149,16 @@ import {
   CritiqueTheaterMount,
   useCritiqueTheaterEnabled,
 } from './Theater';
+import { useIframeKeepAlivePool } from './IframeKeepAlivePool';
 import { decideAutoOpenAfterWrite } from './auto-open-file';
+import { buildRepoImportPrompt, designSystemNeedsRepoConnect } from './design-system-github-evidence';
+import { collectReferencedJsxNames } from '../runtime/jsx-module-refs';
 import { FileWorkspace } from './FileWorkspace';
-import { Icon } from './Icon';
 import {
   type PluginFolderAgentAction,
 } from './design-files/pluginFolderActions';
 import { CenteredLoader } from './Loading';
+import type { SettingsSection } from './SettingsDialog';
 import { Toast } from './Toast';
 import { useDesignMdState } from '../hooks/useDesignMdState';
 import { useFinalizeProject } from '../hooks/useFinalizeProject';
@@ -158,6 +168,17 @@ import { buildContinueInCliToast } from '../lib/build-continue-in-cli-toast';
 import { buildClipboardPrompt } from '../lib/build-clipboard-prompt';
 import { copyToClipboard } from '../lib/copy-to-clipboard';
 import { effectiveMaxTokens } from '../state/maxTokens';
+import { effectiveAgentModelChoice } from './agentModelSelection';
+import { mediaExecutionPolicyForProjectMetadata } from '../media/execution-policy';
+import {
+  buildFinalizeCredentialsMissingToast,
+  buildFinalizeRequest,
+} from '../lib/resolve-finalize-request';
+
+
+type ProjectChatSendMeta = ChatSendMeta & {
+  retryOfAssistantId?: string;
+};
 
 interface Props {
   project: Project;
@@ -196,7 +217,8 @@ interface Props {
     choice: { model?: string; reasoning?: string },
   ) => void;
   onRefreshAgents: () => void;
-  onOpenSettings: () => void;
+  onOpenSettings: (section?: SettingsSection) => void;
+  onOpenAmrSettings?: () => void;
   onOpenMcpSettings?: () => void;
   // Pet wiring forwarded to the chat composer so users can adopt /
   // wake / tuck a pet without leaving the project view.
@@ -208,6 +230,18 @@ interface Props {
   onTouchProject: () => void;
   onProjectChange: (next: Project) => void;
   onProjectsRefresh: () => void;
+  onChangeDefaultDesignSystem?: (designSystemId: string | null) => void;
+  onDesignSystemsRefresh?: () => Promise<void> | void;
+}
+
+interface QueuedChatSend {
+  id: string;
+  conversationId: string;
+  prompt: string;
+  attachments: ChatAttachment[];
+  commentAttachments: ChatCommentAttachment[];
+  meta?: ProjectChatSendMeta;
+  createdAt: number;
 }
 
 let liveArtifactEventSequence = 0;
@@ -467,6 +501,7 @@ export function ProjectView({
   onAgentModelChange,
   onRefreshAgents,
   onOpenSettings,
+  onOpenAmrSettings,
   onOpenMcpSettings,
   onAdoptPetInline,
   onTogglePet,
@@ -476,9 +511,12 @@ export function ProjectView({
   onTouchProject,
   onProjectChange,
   onProjectsRefresh,
+  onChangeDefaultDesignSystem,
+  onDesignSystemsRefresh,
 }: Props) {
-  const t = useT();
+  const { locale, t } = useI18n();
   const analytics = useAnalytics();
+  const iframeKeepAlivePool = useIframeKeepAlivePool();
   // P0 page_view page_name=chat_panel — fire once per project mount.
   // ProjectView outlives conversation switches (ChatPane is keyed by
   // activeConversationId so it remounts when the user switches chats,
@@ -546,6 +584,9 @@ export function ProjectView({
   const [liveArtifacts, setLiveArtifacts] = useState<LiveArtifactSummary[]>([]);
   const [liveArtifactEvents, setLiveArtifactEvents] = useState<LiveArtifactEventItem[]>([]);
   const [workspaceFocused, setWorkspaceFocused] = useState(false);
+  const [commentInspectorActive, setCommentInspectorActive] = useState(false);
+  const commentInspectorPortalId = useId();
+  const leftInspectorActive = commentInspectorActive;
   // Per-session override for the BYOK SenseAudio chat's generate_image
   // tool. Seeded once from Settings (config.byokImageModel) so the
   // composer dropdown opens on the user's chosen default; subsequent
@@ -555,22 +596,6 @@ export function ProjectView({
   const [byokImageModelOverride, setByokImageModelOverride] = useState<string>(
     config.byokImageModel ?? '',
   );
-  // `closed` → no surface; `review` → read-only saved-state panel with a
-  // preview + reopen-to-edit action (#1822); `edit` → the textarea editor.
-  const [instructionsMode, setInstructionsMode] = useState<'closed' | 'review' | 'edit'>('closed');
-  const [instructionsDraft, setInstructionsDraft] = useState(project.customInstructions ?? '');
-  const [instructionsSaving, setInstructionsSaving] = useState(false);
-  // Keep the draft in sync with the server value while the editor is not
-  // open (e.g. after an external update or project switch). If the saved
-  // value disappears while the review panel is showing, collapse the
-  // surface so it never renders a stale or empty read-back.
-  useEffect(() => {
-    if (instructionsMode === 'edit') return;
-    setInstructionsDraft(project.customInstructions ?? '');
-    if (instructionsMode === 'review' && !(project.customInstructions ?? '').trim()) {
-      setInstructionsMode('closed');
-    }
-  }, [project.customInstructions, instructionsMode]);
   // PR #974 round 7 (mrcfps @ useDesignMdState.ts:131): counter that
   // bumps on file-changed SSE events, live_artifact* events, and the
   // chat streaming-completion edge so the staleness chip stays in sync
@@ -618,6 +643,8 @@ export function ProjectView({
     active: null,
   });
   const tabsLoadedRef = useRef(false);
+  const tabsHydratedFromSavedStateRef = useRef(false);
+  const hasAppliedInitialPrimaryOpenRef = useRef(false);
   // Routed to FileWorkspace — bumped whenever the user clicks "open" on a
   // tool card, an attachment chip, or a produced-file chip in chat. We
   // include a nonce so re-clicking the same name after the user closed the
@@ -626,6 +653,8 @@ export function ProjectView({
   const abortRef = useRef<AbortController | null>(null);
   const cancelRef = useRef<AbortController | null>(null);
   const streamingConversationIdRef = useRef<string | null>(null);
+  const [queuedChatSends, setQueuedChatSends] = useState<QueuedChatSend[]>([]);
+  const queuedChatSendsRef = useRef<QueuedChatSend[]>([]);
   const sendTextBufferRef = useRef<BufferedTextUpdates | null>(null);
   const reattachTextBuffersRef = useRef<Set<BufferedTextUpdates>>(new Set());
   const reattachControllersRef = useRef<Map<string, AbortController>>(new Map());
@@ -664,6 +693,8 @@ export function ProjectView({
   useEffect(() => {
     setChatSeed(null);
     setAutoAuditRepairSeed(null);
+    queuedChatSendsRef.current = [];
+    setQueuedChatSends([]);
   }, [project.id]);
   // Monotonic token bumped on every `conversation-created` refresh dispatch.
   // Two rapid events (e.g. concurrent routine runs against the same reused
@@ -689,10 +720,24 @@ export function ProjectView({
   const currentConversationBusy = currentConversationLoading
     || currentConversationStreaming
     || currentConversationHasActiveRun;
+  const currentConversationAwaitingActiveRunAttach =
+    currentConversationHasActiveRun && !currentConversationStreaming;
   const currentConversationSendDisabled = currentConversationLoading
-    || currentConversationHasActiveRun
-    || failedMessagesConversationId === activeConversationId;
+    || failedMessagesConversationId === activeConversationId
+    || currentConversationAwaitingActiveRunAttach;
   const currentConversationActionDisabled = currentConversationBusy || currentConversationSendDisabled;
+  const currentConversationQueueDisabled = currentConversationLoading
+    || failedMessagesConversationId === activeConversationId;
+  const currentConversationQueuedItems = activeConversationId
+    ? queuedChatSends
+        .filter((item) => item.conversationId === activeConversationId)
+        .map((item) => ({
+          id: item.id,
+          prompt: item.prompt,
+          attachments: item.attachments,
+          commentAttachments: item.commentAttachments,
+        }))
+    : [];
   const newConversationDisabled = creatingConversation;
   const activeCompletionNotificationRunsRef = useRef<Set<string>>(new Set());
   const completedNotificationRunsRef = useRef<Set<string>>(new Set());
@@ -976,9 +1021,12 @@ export function ProjectView({
   useEffect(() => {
     let cancelled = false;
     tabsLoadedRef.current = false;
+    tabsHydratedFromSavedStateRef.current = false;
+    hasAppliedInitialPrimaryOpenRef.current = false;
     (async () => {
       const state = await loadTabs(project.id);
       if (cancelled) return;
+      tabsHydratedFromSavedStateRef.current = state.hasSavedState === true;
       setOpenTabsState(state);
       tabsLoadedRef.current = true;
     })();
@@ -1008,6 +1056,32 @@ export function ProjectView({
     projectFilesRef.current = projectFiles;
   }, [projectFiles]);
 
+  // Cache HTML file contents so the auto-open module check (issue #2744) does
+  // not re-fetch unchanged entries on every Write. Keyed by file name with the
+  // mtime stored alongside, so a rewrite REPLACES the file's single entry
+  // rather than accreting a new key. Bounded by the project's HTML file count.
+  const htmlContentCacheRef = useRef<Map<string, { mtime: number; text: string | null }>>(
+    new Map(),
+  );
+  const readProjectHtml = useCallback(
+    async (name: string): Promise<string | null> => {
+      const file = projectFilesRef.current.find((entry) => entry.name === name);
+      const mtime = file?.mtime ?? 0;
+      const cached = htmlContentCacheRef.current.get(name);
+      if (cached && cached.mtime === mtime) return cached.text;
+      try {
+        const response = await fetch(projectRawUrl(project.id, name));
+        const text = response.ok ? await response.text() : null;
+        htmlContentCacheRef.current.set(name, { mtime, text });
+        return text;
+      } catch {
+        htmlContentCacheRef.current.set(name, { mtime, text: null });
+        return null;
+      }
+    },
+    [project.id],
+  );
+
   const refreshLiveArtifacts = useCallback(async (): Promise<LiveArtifactSummary[]> => {
     const next = await fetchLiveArtifacts(project.id);
     setLiveArtifacts(next);
@@ -1018,6 +1092,24 @@ export function ProjectView({
     const [nextFiles] = await Promise.all([refreshProjectFiles(), refreshLiveArtifacts()]);
     return nextFiles;
   }, [refreshLiveArtifacts, refreshProjectFiles]);
+
+  useEffect(() => {
+    if (!tabsLoadedRef.current) return;
+    if (hasAppliedInitialPrimaryOpenRef.current) return;
+    if (routeFileName) return;
+    if (openTabsState.active || openTabsState.tabs.length > 0) {
+      hasAppliedInitialPrimaryOpenRef.current = true;
+      return;
+    }
+    if (tabsHydratedFromSavedStateRef.current) {
+      hasAppliedInitialPrimaryOpenRef.current = true;
+      return;
+    }
+    const primaryFile = selectPrimaryProjectFile(projectFiles);
+    if (!primaryFile) return;
+    hasAppliedInitialPrimaryOpenRef.current = true;
+    persistTabsState({ tabs: [primaryFile.name], active: primaryFile.name });
+  }, [openTabsState.active, openTabsState.tabs.length, persistTabsState, projectFiles, routeFileName]);
 
   const requestOpenFile = useCallback((name: string) => {
     if (!name) return;
@@ -1176,6 +1268,7 @@ export function ProjectView({
   );
   const handleProjectEvent = useCallback((evt: ProjectEvent) => {
     if (evt.type === 'file-changed') {
+      iframeKeepAlivePool.evictProject(project.id);
       coalescedFileChangedRefresh();
       return;
     }
@@ -1224,8 +1317,45 @@ export function ProjectView({
     // Live artifact events come from chat-turn-emitted artifacts; they
     // also imply the conversation transcript changed.
     setDesignMdRefreshKey((n) => n + 1);
-  }, [onProjectsRefresh, refreshLiveArtifacts, project.id, coalescedFileChangedRefresh]);
+  }, [coalescedFileChangedRefresh, iframeKeepAlivePool, onProjectsRefresh, refreshLiveArtifacts, project.id]);
   useProjectFileEvents(project.id, daemonLive, handleProjectEvent);
+
+  const activePromptContextSignature = useMemo(() => {
+    const skill = project.skillId
+      ? (skills.find((s) => s.id === project.skillId) ??
+        designTemplates.find((s) => s.id === project.skillId))
+      : null;
+    const designSystem = project.designSystemId
+      ? designSystems.find((d) => d.id === project.designSystemId)
+      : null;
+    return JSON.stringify({
+      designSystem: designSystem
+        ? {
+            id: designSystem.id,
+            title: designSystem.title,
+            category: designSystem.category,
+            summary: designSystem.summary,
+            source: designSystem.source ?? null,
+          }
+        : null,
+      skill: skill
+        ? {
+            id: skill.id,
+            name: skill.name,
+            description: skill.description,
+            mode: skill.mode,
+            source: skill.source ?? null,
+            upstream: skill.upstream,
+          }
+        : null,
+    });
+  }, [designSystems, designTemplates, project.designSystemId, project.skillId, skills]);
+  const previousPromptContextSignatureRef = useRef(activePromptContextSignature);
+  useEffect(() => {
+    if (previousPromptContextSignatureRef.current === activePromptContextSignature) return;
+    previousPromptContextSignatureRef.current = activePromptContextSignature;
+    iframeKeepAlivePool.evictProject(project.id, { includeActive: true });
+  }, [activePromptContextSignature, iframeKeepAlivePool, project.id]);
 
   // When the URL points at a specific file, fire an open request so the
   // FileWorkspace promotes it to an active tab. We watch routeFileName
@@ -1385,6 +1515,7 @@ export function ProjectView({
       audioVoiceOptions,
       audioVoiceOptionsError: audioVoiceOptionsLookupError,
       streamFormat: config.mode === 'api' ? 'plain' : undefined,
+      locale,
       userInstructions: config.customInstructions,
       projectInstructions: project.customInstructions,
     });
@@ -1398,6 +1529,7 @@ export function ProjectView({
     designSystems,
     config.mode,
     config.customInstructions,
+    locale,
   ]);
 
   const persistMessage = useCallback(
@@ -1572,12 +1704,15 @@ export function ProjectView({
     [updateMessageById, activeConversationId, project.id],
   );
 
+  // `code` is the structured API error code (e.g. AGENT_AUTH_REQUIRED); it
+  // rides along on the error status event so AssistantMessage can render the
+  // hosted-AMR nudge for model/auth/quota failures on non-AMR agents.
   const appendAssistantErrorEvent = useCallback(
-    (messageId: string, message: string) => {
+    (messageId: string, message: string, code?: string) => {
       if (!message) return;
       updateMessageById(
         messageId,
-        (prev) => appendErrorStatusEvent(prev, message),
+        (prev) => appendErrorStatusEvent(prev, message, code),
         true,
       );
     },
@@ -1880,6 +2015,7 @@ export function ProjectView({
         const textBuffer = createBufferedTextUpdates({
           updateMessage: (updater) => updateMessageById(message.id, updater),
           persistSoon,
+          flushAndPersistNow: () => persistNow({ keepalive: true }),
           onContentDelta: applyContentDelta,
         });
         reattachTextBuffersRef.current.add(textBuffer);
@@ -1923,7 +2059,7 @@ export function ProjectView({
                   ...prev,
                   content: needsFullReplay ? replayedContent : prev.content,
                   events: needsFullReplay ? replayedEvents : prev.events,
-                  runStatus: 'succeeded',
+                  runStatus: resolveSucceededRunStatus(prev.runStatus),
                   endedAt: prev.endedAt ?? Date.now(),
                 }),
                 true,
@@ -1935,9 +2071,12 @@ export function ProjectView({
               clearActiveRunRefs(reattachConversationId, controller, cancelController);
               clearStreamingMarker(reattachConversationId);
               void (async () => {
-                const beforeFiles = await refreshProjectFiles();
-                const beforeFileNames = new Set(beforeFiles.map((f) => f.name));
-                let nextFiles = beforeFiles;
+                const preTurn = message.preTurnFileNames;
+                let nextFiles = await refreshProjectFiles();
+                // Use the turn-start snapshot when available so reload
+                // recovers files produced before the artifact write too;
+                // fall back to the current list for legacy messages.
+                const beforeFileNames = new Set(preTurn ?? nextFiles.map((f) => f.name));
                 let recoveredExistingArtifact: ProjectFile | null = null;
                 if (parsedArtifact?.html) {
                   const runStartedAt = status.createdAt || message.startedAt || message.createdAt;
@@ -1954,9 +2093,8 @@ export function ProjectView({
                     nextFiles = await refreshProjectFiles();
                   }
                 }
-                const produced = recoveredExistingArtifact
-                  ? [recoveredExistingArtifact]
-                  : nextFiles.filter((f) => !beforeFileNames.has(f.name));
+                const diff = computeProducedFiles(beforeFileNames, nextFiles) ?? [];
+                const produced = mergeRecoveredArtifact(diff, recoveredExistingArtifact);
                 if (produced.length > 0) {
                   updateMessageById(
                     message.id,
@@ -1970,14 +2108,19 @@ export function ProjectView({
               onProjectsRefresh();
             },
             onError: (err) => {
+              const errorCode = (err as Error & { code?: string }).code;
               textBuffer.flush();
               textBuffer.cancel();
               unregisterTextBuffer();
               setError(err.message);
-              appendAssistantErrorEvent(message.id, err.message);
+              appendAssistantErrorEvent(message.id, err.message, errorCode);
               updateMessageById(
                 message.id,
-                (prev) => ({ ...prev, runStatus: 'failed', endedAt: prev.endedAt ?? Date.now() }),
+                (prev) => ({
+                  ...prev,
+                  runStatus: 'failed',
+                  endedAt: prev.endedAt ?? Date.now(),
+                }),
                 true,
               );
               completedReattachRunsRef.current.add(runId);
@@ -2064,22 +2207,78 @@ export function ProjectView({
     onProjectsRefresh,
   ]);
 
+  const enqueueChatSend = useCallback((item: QueuedChatSend) => {
+    const next = [...queuedChatSendsRef.current, item];
+    queuedChatSendsRef.current = next;
+    setQueuedChatSends(next);
+  }, []);
+
+  const removeQueuedChatSend = useCallback((id: string) => {
+    const next = queuedChatSendsRef.current.filter((item) => item.id !== id);
+    queuedChatSendsRef.current = next;
+    setQueuedChatSends(next);
+  }, []);
+
+  const updateQueuedChatSend = useCallback((id: string, prompt: string) => {
+    const next = queuedChatSendsRef.current.map((item) =>
+      item.id === id ? { ...item, prompt } : item,
+    );
+    queuedChatSendsRef.current = next;
+    setQueuedChatSends(next);
+  }, []);
+
+  const prioritizeQueuedChatSend = useCallback((id: string) => {
+    const item = queuedChatSendsRef.current.find((candidate) => candidate.id === id);
+    if (!item) return;
+    const next = [item, ...queuedChatSendsRef.current.filter((candidate) => candidate.id !== id)];
+    queuedChatSendsRef.current = next;
+    setQueuedChatSends(next);
+  }, []);
+
   const handleSend = useCallback(
     async (
       prompt: string,
       attachments: ChatAttachment[],
       commentAttachments: ChatCommentAttachment[] = commentsToAttachments(attachedComments),
-      meta?: ChatSendMeta,
+      meta?: ProjectChatSendMeta,
+      baseMessages?: ChatMessage[],
     ) => {
       if (!activeConversationId) return;
       if (messagesConversationIdRef.current !== activeConversationId) return;
-      if (currentConversationBusy) return;
-      if (!prompt.trim() && attachments.length === 0 && commentAttachments.length === 0) return;
+      const retryTarget = meta?.retryOfAssistantId
+        ? resolveRetryTarget(messages, meta.retryOfAssistantId)
+        : null;
+      if (meta?.retryOfAssistantId && !retryTarget) return;
+      const historyBase = retryTarget ? retryTarget.priorMessages : baseMessages ?? messages;
+      if (
+        !retryTarget &&
+        !prompt.trim() &&
+        attachments.length === 0 &&
+        commentAttachments.length === 0
+      ) return;
+      if (currentConversationBusy) {
+        enqueueChatSend({
+          id: randomUUID(),
+          conversationId: activeConversationId,
+          prompt,
+          attachments,
+          commentAttachments,
+          ...(meta === undefined ? {} : { meta }),
+          createdAt: Date.now(),
+        });
+        if (commentAttachments.length > 0) {
+          const reservedCommentIds = new Set(commentAttachments.map((attachment) => attachment.id));
+          setAttachedComments((current) =>
+            current.filter((comment) => !reservedCommentIds.has(comment.id)),
+          );
+        }
+        return;
+      }
       setChatSeed(null);
       const runConversationId = activeConversationId;
       setError(null);
       const startedAt = Date.now();
-      const userMsg: ChatMessage = {
+      const userMsg: ChatMessage = retryTarget?.userMsg ?? {
         id: randomUUID(),
         role: 'user',
         content: prompt,
@@ -2087,6 +2286,8 @@ export function ProjectView({
         attachments: attachments.length > 0 ? attachments : undefined,
         commentAttachments: commentAttachments.length > 0 ? commentAttachments : undefined,
       };
+      const runAttachments = userMsg.attachments ?? [];
+      const runCommentAttachments = userMsg.commentAttachments ?? [];
       const selectedAgent =
         config.mode === 'daemon' && config.agentId
           ? agentsById.get(config.agentId)
@@ -2095,6 +2296,10 @@ export function ProjectView({
         config.mode === 'daemon' && config.agentId
           ? config.agentModels?.[config.agentId]
           : undefined;
+      const effectiveSelectedAgentChoice = effectiveAgentModelChoice(
+        selectedAgent,
+        selectedAgentChoice,
+      );
       const assistantAgentId =
         config.mode === 'daemon'
           ? config.agentId ?? undefined
@@ -2104,10 +2309,11 @@ export function ProjectView({
           ? agentModelDisplayName(
               config.agentId,
               selectedAgent?.name,
-              selectedAgentChoice?.model,
+              effectiveSelectedAgentChoice?.model,
             )
           : apiProtocolModelLabel(config.apiProtocol, config.model);
-      const assistantId = randomUUID();
+      const preTurnFileNames = projectFiles.map((f) => f.name);
+      const assistantId = retryTarget?.failedAssistant.id ?? randomUUID();
       const assistantMsg: ChatMessage = {
         id: assistantId,
         role: 'assistant',
@@ -2115,9 +2321,10 @@ export function ProjectView({
         agentId: assistantAgentId,
         agentName: assistantAgentName,
         events: [],
-        createdAt: startedAt,
+        createdAt: retryTarget?.failedAssistant.createdAt ?? startedAt,
         runStatus: config.mode === 'daemon' ? 'running' : undefined,
         startedAt,
+        preTurnFileNames,
       };
       let latestAssistantMsg: ChatMessage = assistantMsg;
       const updateConversationLatestRun = (
@@ -2146,14 +2353,16 @@ export function ProjectView({
         );
       };
       activeCompletionNotificationRunsRef.current.add(assistantId);
-      const nextHistory = [...messages, userMsg];
+      const nextHistory = retryTarget
+        ? [...retryTarget.priorMessages, userMsg]
+        : [...historyBase, userMsg];
       setMessages([...nextHistory, assistantMsg]);
       markStreamingConversation(runConversationId);
       updateConversationLatestRun(config.mode === 'daemon' ? 'running' : 'queued');
       setArtifact(null);
       savedArtifactRef.current = null;
       onTouchProject();
-      persistMessage(userMsg);
+      if (!retryTarget) persistMessage(userMsg);
       // Intentionally do NOT persist `assistantMsg` here. In daemon mode it
       // starts as runStatus='running' with no runId, which the source-level
       // guard treats as a phantom — the first DB write happens inside
@@ -2161,14 +2370,17 @@ export function ProjectView({
       // mode there is no runStatus, and the buffered text path will persist
       // as soon as the first delta lands.
       persistMessage(assistantMsg);
-      if (commentAttachments.length > 0) {
-        void patchAttachedStatuses(commentAttachments, 'applying');
-        setAttachedComments([]);
+      if (runCommentAttachments.length > 0) {
+        void patchAttachedStatuses(runCommentAttachments, 'applying');
+        const consumedCommentIds = new Set(runCommentAttachments.map((attachment) => attachment.id));
+        setAttachedComments((current) =>
+          current.filter((comment) => !consumedCommentIds.has(comment.id)),
+        );
       }
       // If this is the first turn, derive a working title from the prompt
       // so the conversation is identifiable in the dropdown without a
       // round-trip through the agent.
-      if (messages.length === 0) {
+      if (!retryTarget && historyBase.length === 0) {
         const title = isDesignSystemWorkspacePrompt(prompt)
           ? DESIGN_SYSTEM_WORKSPACE_DISPLAY_TITLE
           : prompt.slice(0, 60).trim();
@@ -2206,7 +2418,7 @@ export function ProjectView({
       // Snapshot the file list at turn-start so we can diff after the
       // agent finishes and surface anything new (e.g. a generated .pptx)
       // as download chips on the assistant message.
-      const beforeFileNames = new Set(projectFiles.map((f) => f.name));
+      const beforeFileNames = new Set(preTurnFileNames);
 
       const parser = createArtifactParser();
       let parsedArtifact: Artifact | null = null;
@@ -2230,6 +2442,13 @@ export function ProjectView({
           persistTimer = null;
           persistMessageById(assistantId);
         }, 500);
+      };
+      const persistAssistantNowKeepalive = () => {
+        if (persistTimer) {
+          clearTimeout(persistTimer);
+          persistTimer = null;
+        }
+        persistMessageById(assistantId, { keepalive: true });
       };
       const pushEvent = (ev: AgentEvent) => {
         textBuffer.flush();
@@ -2276,8 +2495,16 @@ export function ProjectView({
               // Only auto-open if the file actually landed in the project's
               // file list — otherwise an out-of-project Write (e.g. an
               // upstream repo edit) would spawn a permanent placeholder tab.
-              void refreshProjectFiles().then((nextFiles) => {
-                const decision = decideAutoOpenAfterWrite(filePath, nextFiles);
+              void refreshProjectFiles().then(async (nextFiles) => {
+                // A .jsx/.tsx loaded by a sibling HTML entry is a module of a
+                // multi-file React prototype, not a standalone page — don't
+                // strand the user on a dead-end preview tab. Issue #2744.
+                const moduleFileNames = /\.(jsx|tsx)$/i.test(filePath)
+                  ? await collectReferencedJsxNames(nextFiles, readProjectHtml)
+                  : undefined;
+                const decision = decideAutoOpenAfterWrite(filePath, nextFiles, {
+                  moduleFileNames,
+                });
                 if (decision.shouldOpen && decision.fileName) {
                   requestOpenFile(decision.fileName);
                 }
@@ -2332,6 +2559,7 @@ export function ProjectView({
       const textBuffer = createBufferedTextUpdates({
         updateMessage: updateAssistant,
         persistSoon: persistAssistantSoon,
+        flushAndPersistNow: persistAssistantNowKeepalive,
         onContentDelta: applyContentDelta,
       });
       sendTextBufferRef.current = textBuffer;
@@ -2388,8 +2616,8 @@ export function ProjectView({
               true,
               { telemetryFinalized: true },
             );
-            if (commentAttachments.length > 0) {
-              void patchAttachedStatuses(commentAttachments, 'failed');
+            if (runCommentAttachments.length > 0) {
+              void patchAttachedStatuses(runCommentAttachments, 'failed');
             }
             clearActiveRunRefs(runConversationId, controller, cancelController);
             clearStreamingMarker(runConversationId);
@@ -2408,8 +2636,8 @@ export function ProjectView({
               runStatus: finalRunStatus,
             };
           });
-          if (commentAttachments.length > 0) {
-            void patchAttachedStatuses(commentAttachments, 'needs_review');
+          if (runCommentAttachments.length > 0) {
+            void patchAttachedStatuses(runCommentAttachments, 'needs_review');
           }
           clearActiveRunRefs(runConversationId, controller, cancelController);
           clearStreamingMarker(runConversationId);
@@ -2424,7 +2652,7 @@ export function ProjectView({
               await persistArtifact(parsedArtifact, nextFiles);
               nextFiles = await refreshProjectFiles();
             }
-            const produced = nextFiles.filter((f) => !beforeFileNames.has(f.name));
+            const produced = computeProducedFiles(beforeFileNames, nextFiles) ?? [];
             setMessages((curr) => {
               const updated = curr.map((m) =>
                 m.id === assistantId
@@ -2441,11 +2669,12 @@ export function ProjectView({
         },
         onError: (err: Error) => {
           const endedAt = Date.now();
+          const errorCode = (err as Error & { code?: string }).code;
           textBuffer.flush();
           textBuffer.cancel();
           cancelSendTextBuffer();
           setError(err.message);
-          appendAssistantErrorEvent(assistantId, err.message);
+          appendAssistantErrorEvent(assistantId, err.message, errorCode);
           updateAssistant((prev) => ({
             ...prev,
             endedAt,
@@ -2453,8 +2682,8 @@ export function ProjectView({
               ? 'failed'
               : prev.runStatus,
           }));
-          if (commentAttachments.length > 0) {
-            void patchAttachedStatuses(commentAttachments, 'failed');
+          if (runCommentAttachments.length > 0) {
+            void patchAttachedStatuses(runCommentAttachments, 'failed');
           }
           clearActiveRunRefs(runConversationId, controller, cancelController);
           clearStreamingMarker(runConversationId);
@@ -2473,7 +2702,7 @@ export function ProjectView({
           handlers.onError(new Error('Pick a local agent first (top bar).'));
           return;
         }
-        const choice = selectedAgentChoice;
+        const choice = effectiveSelectedAgentChoice;
         // v2 analytics: when the active project is a DS workspace
         // (created by `prepareCreatedDesignSystemProject`, identifiable
         // by `metadata.importedFrom === 'design-system'`), every run
@@ -2517,11 +2746,13 @@ export function ProjectView({
           skillIds: Array.isArray(meta?.skillIds) ? meta.skillIds : [],
           context: meta?.context,
           designSystemId: project.designSystemId ?? null,
-          attachments: attachments.map((a) => a.path),
-          commentAttachments,
+          attachments: runAttachments.map((a) => a.path),
+          commentAttachments: runCommentAttachments,
           research: meta?.research,
+          mediaExecution: mediaExecutionPolicyForProjectMetadata(project.metadata),
           model: choice?.model ?? null,
           reasoning: choice?.reasoning ?? null,
+          locale,
           ...(dsAnalyticsHints ? { analyticsHints: dsAnalyticsHints } : {}),
           onRunCreated: (runId) => {
             const pinnedAssistant = {
@@ -2616,6 +2847,7 @@ export function ProjectView({
           userMsg.id,
           project.id,
           projectFiles,
+          { omitNativeImageAttachments: usesAnthropicProxy(config) },
         );
         pushEvent({ kind: 'status', label: 'requesting', detail: config.model });
         let accumulatedAssistantText = '';
@@ -2658,8 +2890,10 @@ export function ProjectView({
       attachedComments,
       activeConversationId,
       currentConversationBusy,
+      enqueueChatSend,
       messages,
       config,
+      locale,
       agentsById,
       composedSystemPrompt,
       onTouchProject,
@@ -2682,6 +2916,120 @@ export function ProjectView({
     ],
   );
 
+  const sendQueuedChatSendNow = useCallback((id: string) => {
+    const item = queuedChatSendsRef.current.find((candidate) => candidate.id === id);
+    if (!item) return;
+    if (currentConversationBusy) {
+      prioritizeQueuedChatSend(id);
+      return;
+    }
+    removeQueuedChatSend(id);
+    void handleSend(
+      item.prompt,
+      item.attachments,
+      item.commentAttachments,
+      item.meta,
+    );
+  }, [currentConversationBusy, handleSend, prioritizeQueuedChatSend, removeQueuedChatSend]);
+
+  useEffect(() => {
+    if (!activeConversationId) return;
+    if (currentConversationBusy) return;
+    if (messagesConversationIdRef.current !== activeConversationId) return;
+    const next = queuedChatSendsRef.current.find(
+      (item) => item.conversationId === activeConversationId,
+    );
+    if (!next) return;
+    removeQueuedChatSend(next.id);
+    void handleSend(
+      next.prompt,
+      next.attachments,
+      next.commentAttachments,
+      next.meta,
+    );
+  }, [
+    activeConversationId,
+    currentConversationBusy,
+    queuedChatSends,
+    handleSend,
+    removeQueuedChatSend,
+  ]);
+
+  const handleRetry = useCallback(
+    (assistantMessage: ChatMessage) => {
+      if (currentConversationActionDisabled) return;
+      void handleSend('', [], [], { retryOfAssistantId: assistantMessage.id });
+    },
+    [currentConversationActionDisabled, handleSend],
+  );
+
+  // "Switch to AMR & retry" from the failed-run card: switch the run to AMR,
+  // open Settings on the AMR controls so the user can sign in / authorize /
+  // top up, and arm an auto-retry that fires once AMR is selected AND signed
+  // in (see the effect below).
+  const [pendingAmrRetry, setPendingAmrRetry] = useState<ChatMessage | null>(null);
+  const handleSwitchToAmrAndRetry = useCallback(
+    (failedAssistant: ChatMessage) => {
+      if (currentConversationActionDisabled) return;
+      onModeChange('daemon');
+      onAgentChange('amr');
+      onOpenAmrSettings?.();
+      setPendingAmrRetry(failedAssistant);
+    },
+    [currentConversationActionDisabled, onModeChange, onAgentChange, onOpenAmrSettings],
+  );
+  // PR #3157: Antigravity's `agy -p` cannot complete OAuth on its own,
+  // so the auth banner offers a one-click "Sign in via terminal"
+  // button that POSTs to the daemon. The daemon opens a system
+  // Terminal running `agy` (osascript / x-terminal-emulator /
+  // `cmd /c start`); the user finishes Google sign-in there and then
+  // clicks Retry to redo the chat run. We don't auto-retry because
+  // the OAuth completion happens externally with no reliable signal
+  // back to the chat — the secondary Retry button on the same banner
+  // covers the manual case.
+  const handleLaunchAntigravityOauth = useCallback(async () => {
+    try {
+      const { launchAntigravityOauth } = await import('../providers/daemon');
+      const result = await launchAntigravityOauth();
+      if (!result.ok) {
+        // Surface the daemon-side reason so the user knows whether
+        // the spawn failed because of missing osascript / unsupported
+        // platform / etc. instead of silently swallowing it.
+        console.warn('[antigravity] oauth-launch failed:', result.error);
+      }
+    } catch (err) {
+      console.warn('[antigravity] oauth-launch threw:', err);
+    }
+  }, []);
+  // Poll the AMR login status while a retry is armed, rather than only reacting
+  // to the AmrLoginPill's status event — the user may close Settings (which
+  // unmounts the pill and stops its polling) before finishing sign-in in the
+  // browser. Polling here keeps working regardless of the pill's lifecycle.
+  // Fires once AMR is the selected agent AND the account is signed in.
+  useEffect(() => {
+    if (!pendingAmrRetry) return;
+    let cancelled = false;
+    const tryRetry = async () => {
+      if (cancelled) return;
+      if (!(config.mode === 'daemon' && config.agentId === 'amr')) return;
+      const status = await fetchVelaLoginStatus().catch(() => null);
+      if (cancelled || status?.loggedIn !== true) return;
+      setPendingAmrRetry(null);
+      handleRetry(pendingAmrRetry);
+    };
+    void tryRetry();
+    const interval = setInterval(() => void tryRetry(), 2000);
+    // Give up after a few minutes so we never poll forever.
+    const stop = setTimeout(() => {
+      if (!cancelled) setPendingAmrRetry(null);
+    }, 5 * 60 * 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      clearTimeout(stop);
+    };
+  }, [pendingAmrRetry, config.mode, config.agentId, handleRetry]);
+
   useEffect(() => {
     if (!autoAuditRepairSeed) return;
     if (!activeConversationId) return;
@@ -2701,11 +3049,15 @@ export function ProjectView({
 
   const handleSendBoardCommentAttachments = useCallback(
     async (commentAttachments: ChatCommentAttachment[]) => {
-      if (currentConversationActionDisabled || commentAttachments.length === 0) return;
+      if (currentConversationQueueDisabled || commentAttachments.length === 0) return false;
+      setWorkspaceFocused(false);
+      setCommentInspectorActive(false);
       await handleSend('', [], commentAttachments);
+      return true;
     },
-    [handleSend, currentConversationActionDisabled],
+    [handleSend, currentConversationQueueDisabled],
   );
+  const commentQueueOnSend = currentConversationBusy && !currentConversationQueueDisabled;
 
   const handleContinueRemainingTasks = useCallback(
     (_assistantMessage: ChatMessage, todos: TodoItem[]) => {
@@ -2736,12 +3088,16 @@ export function ProjectView({
     config.mode === 'daemon' && config.agentId
       ? config.agentModels?.[config.agentId]
       : undefined;
+  const effectiveSelectedPluginActionChoice = effectiveAgentModelChoice(
+    selectedPluginActionAgent,
+    selectedPluginActionChoice,
+  );
   const pluginWorkflowAgentName =
     config.mode === 'daemon'
       ? agentModelDisplayName(
           config.agentId,
           selectedPluginActionAgent?.name,
-          selectedPluginActionChoice?.model,
+          effectiveSelectedPluginActionChoice?.model,
         )
       : apiProtocolModelLabel(config.apiProtocol, config.model);
 
@@ -3100,36 +3456,7 @@ export function ProjectView({
   const handleExportAsPptx = useCallback(
     (fileName: string) => {
       if (currentConversationActionDisabled) return;
-      const baseTitle = fileName.replace(/\.html?$/i, '') || fileName;
-      const prompt =
-        `Export @${fileName} as an editable PPTX file titled "${baseTitle}".\n\n` +
-        `**Generate.** Use python-pptx (preferred — full XML control). Apply the ` +
-        `footer-rail + cursor-flow discipline from \`skills/pptx-html-fidelity-audit/SKILL.md\` ` +
-        `Step 4 from the start: define \`CONTENT_MAX_Y = 6.70"\` and \`FOOTER_TOP = 6.85"\` ` +
-        `as constants, route every content block through a \`Cursor\` that refuses to cross ` +
-        `the rail, and use budget centering (not \`MARGIN_TOP\`) for hero/cover slides. ` +
-        `Preserve \`<em>\` / \`<i>\` as \`italic=True\` on Latin runs only — never on CJK. ` +
-        `Set the \`<a:latin>\` and \`<a:ea>\` typeface slots explicitly so Chinese runs ` +
-        `don't fall back to Microsoft JhengHei.\n\n` +
-        `**Verify (mandatory gate).** After writing, run ` +
-        `\`python skills/pptx-html-fidelity-audit/scripts/verify_layout.py "${baseTitle}.pptx"\` ` +
-        `(quote the path — filenames may contain spaces). Zero rail violations is the gate ` +
-        `for "shippable". If violations remain, walk Steps 2-4 of the SKILL.md ` +
-        `(extract dump → audit table → re-export) — do not declare done by eyeballing the ` +
-        `deck. If 🟡 typography issues surface (italic missing, unexpected \`Calibri\` / ` +
-        `\`Microsoft JhengHei\` in the XML), consult ` +
-        `\`skills/pptx-html-fidelity-audit/references/font-discipline.md\` for the ` +
-        `five-layer font audit.\n\n` +
-        `**Customizing rails.** The default \`CONTENT_MAX_Y = 6.70"\` / ` +
-        `\`FOOTER_TOP = 6.85"\` constants suit a 16:9 canvas with a slim footer. If the ` +
-        `design system needs different rails (wider footer, 4:3 canvas), pass ` +
-        `\`--content-max-y\` / \`--canvas-h\` to \`verify_layout.py\` and update the matching ` +
-        `constants in the export script — see \`references/layout-discipline.md\` §1.\n\n` +
-        `If \`python-pptx\` or the verifier is unavailable in this environment, say so ` +
-        `explicitly — don't claim fidelity is correct without evidence.\n\n` +
-        `Save into the current project folder (this conversation's working directory) as ` +
-        `\`${baseTitle}.pptx\`. Report the on-disk path and a 1-line fidelity summary ` +
-        `(e.g. "0 rail violations across 14 slides") when done.`;
+      const prompt = buildPptxExportPrompt(fileName);
       const attachment: ChatAttachment = {
         path: fileName,
         name: fileName,
@@ -3192,6 +3519,20 @@ export function ProjectView({
       messagesConversationIdRef.current = fresh.id;
       setConversations((curr) => [fresh, ...curr]);
       setActiveConversationId(fresh.id);
+      // Push the new conversation id into the URL synchronously so the
+      // route-sync effect sees a matching `routeConversationId` before
+      // it can revert `activeConversationId`. Without this, the route-sync
+      // effect can fight the conversation switch, preventing users from
+      // switching back to older conversations after creating a new one.
+      navigate(
+        {
+          kind: 'project',
+          projectId: project.id,
+          conversationId: fresh.id,
+          fileName: openTabsState.active ?? null,
+        },
+        { replace: true },
+      );
       setError(null);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Could not create a conversation for this project.';
@@ -3201,7 +3542,7 @@ export function ProjectView({
       creatingConversationRef.current = false;
       setCreatingConversation(false);
     }
-  }, [project.id, activeConversationId, messages.length]);
+  }, [project.id, activeConversationId, messages.length, navigate, openTabsState.active]);
 
   const handleSelectConversation = useCallback((id: string) => {
     if (id === activeConversationId && failedMessagesConversationId !== id) return;
@@ -3264,17 +3605,6 @@ export function ProjectView({
       });
     },
     [project.id, activeConversationId, onProjectsRefresh],
-  );
-
-  const handleRenameConversation = useCallback(
-    async (id: string, title: string) => {
-      const trimmed = title.trim() || null;
-      setConversations((curr) =>
-        curr.map((c) => (c.id === id ? { ...c, title: trimmed } : c)),
-      );
-      await patchConversation(project.id, id, { title: trimmed });
-    },
-    [project.id],
   );
 
   const handleProjectRename = useCallback(
@@ -3370,23 +3700,6 @@ export function ProjectView({
     [project, onProjectChange, designSystems, analytics.track],
   );
 
-  const handleSaveInstructions = useCallback(async () => {
-    const value = instructionsDraft.trim() || undefined;
-    // After a save, land on the review panel so the saved value is read
-    // back immediately (#1822); collapse only when it was cleared.
-    const settle = () => setInstructionsMode(value ? 'review' : 'closed');
-    if (value === (project.customInstructions ?? undefined)) {
-      settle();
-      return;
-    }
-    setInstructionsSaving(true);
-    const result = await patchProject(project.id, { customInstructions: value ?? null });
-    setInstructionsSaving(false);
-    if (!result) return;
-    onProjectChange(result);
-    settle();
-  }, [project, onProjectChange, instructionsDraft]);
-
   const projectMeta = useMemo(() => {
     // Design system is rendered by the adjacent picker chip — keep the
     // bare meta string focused on skill / mode so the two surfaces
@@ -3412,6 +3725,60 @@ export function ProjectView({
     () => designSystemProject ? latestDesignSystemActivityEvents(messages) : [],
     [designSystemProject, messages],
   );
+  const connectRepoNeeded = useMemo(
+    () => designSystemNeedsRepoConnect(designSystemProject, projectFiles.map((file) => file.name)),
+    [designSystemProject, projectFiles],
+  );
+  // Only the connect-repo CTA copy depends on this (connect vs re-import), so
+  // resolve it lazily and only while the CTA is actually showing. Tri-state:
+  // `undefined` means the status fetch has not resolved yet, which keeps the
+  // CTA neutral and disabled so a fast click can't fire the wrong action.
+  const [githubConnected, setGithubConnected] = useState<boolean | undefined>(undefined);
+  useEffect(() => {
+    if (!connectRepoNeeded) {
+      setGithubConnected(undefined);
+      return;
+    }
+    let aborted = false;
+    const controller = new AbortController();
+    const refresh = () => {
+      void fetchConnectorStatuses({ signal: controller.signal }).then((statuses) => {
+        if (!aborted) setGithubConnected(statuses.github?.status === 'connected');
+      });
+    };
+    refresh();
+    // Connecting GitHub happens in the Connectors dialog or an external OAuth
+    // window, neither of which changes connectRepoNeeded. Re-check on focus so
+    // the CTA flips from "Connect GitHub" to "Import repo" when the user returns.
+    const onFocus = () => refresh();
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+    return () => {
+      aborted = true;
+      controller.abort();
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [connectRepoNeeded]);
+
+  // Signal that pushes a draft into the chat composer (the "Import repo" CTA).
+  const [composerDraftSignal, setComposerDraftSignal] = useState<{ text: string; nonce: number }>();
+  // One handler for both the review banner and the chat CTA. When GitHub is
+  // not connected it opens Connectors; once connected it prefills the composer
+  // with the import instruction so the user can review and send it.
+  const handleConnectRepo = useCallback(() => {
+    // Status not resolved yet; the CTA is disabled in this window, but guard
+    // anyway so a stray call can't route a connected account to Connectors.
+    if (githubConnected === undefined) return;
+    if (githubConnected) {
+      setComposerDraftSignal({
+        text: buildRepoImportPrompt(designSystemProject, projectFiles.map((file) => file.name)),
+        nonce: Date.now(),
+      });
+    } else {
+      onOpenSettings('composio');
+    }
+  }, [githubConnected, onOpenSettings, designSystemProject, projectFiles]);
 
   const isDeck = useMemo(
     () =>
@@ -3645,17 +4012,12 @@ export function ProjectView({
   // shortcut wiring. Close to the JSX so the data flow is easy to
   // trace from the toolbar back to its sources.
   const handleFinalize = useCallback(() => {
-    const protocol = config.apiProtocol ?? 'anthropic';
-    void finalize.trigger({
-      protocol,
-      apiKey: config.apiKey,
-      baseUrl: config.baseUrl,
-      model: config.model,
-      maxTokens: effectiveMaxTokens(config),
-      ...(protocol === 'azure' && config.apiVersion?.trim()
-        ? { apiVersion: config.apiVersion.trim() }
-        : {}),
-    }).then((result) => {
+    const request = buildFinalizeRequest(config);
+    if (!request) {
+      setProjectActionsToast(buildFinalizeCredentialsMissingToast(config));
+      return;
+    }
+    void finalize.trigger(request).then((result) => {
       if (result) void designMdState.refresh();
     });
   }, [finalize, config, designMdState]);
@@ -3859,149 +4221,29 @@ export function ProjectView({
   // resulting SSE stream.
   const critiqueTheaterEnabled = useCritiqueTheaterEnabled();
 
+  // CLI / agent selector lives below the chat conversation (composer footer),
+  // not in the top-right header.
+  const executionControls = (
+    <AvatarMenu
+      config={config}
+      agents={agents}
+      daemonLive={daemonLive}
+      onModeChange={onModeChange}
+      onAgentChange={onAgentChange}
+      onAgentModelChange={onAgentModelChange}
+      onOpenSettings={onOpenSettings}
+      onRefreshAgents={onRefreshAgents}
+      onBack={onBack}
+      placement="up"
+    />
+  );
+
   return (
     <div className="app">
       <CritiqueTheaterMount
         projectId={project.id}
         enabled={critiqueTheaterEnabled}
       />
-      <AppChromeHeader
-        showTrafficSpace={false}
-        onBack={onBack}
-        backLabel={t('project.backToProjects')}
-        actions={(
-          <>
-            <HandoffButton projectId={project.id} />
-            <AvatarMenu
-              config={config}
-              agents={agents}
-              daemonLive={daemonLive}
-              onModeChange={onModeChange}
-              onAgentChange={onAgentChange}
-              onAgentModelChange={onAgentModelChange}
-              onOpenSettings={onOpenSettings}
-              onRefreshAgents={onRefreshAgents}
-              onBack={onBack}
-            />
-          </>
-        )}
-      >
-        <div className="app-project-title">
-          <span className="app-project-title-line">
-            <span
-              className="title editable"
-              data-testid="project-title"
-              tabIndex={0}
-              role="textbox"
-              suppressContentEditableWarning
-              contentEditable
-              onBlur={(e) => handleProjectRename(e.currentTarget.textContent ?? '')}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  (e.currentTarget as HTMLElement).blur();
-                }
-              }}
-            >
-              {project.name}
-            </span>
-            <span className="meta" data-testid="project-meta">{projectMeta}</span>
-            <ProjectDesignSystemPicker
-              designSystems={designSystems}
-              selectedId={project.designSystemId ?? null}
-              onChange={handleChangeDesignSystemId}
-            />
-            {(project.customInstructions ?? '').trim() ? (
-              <button
-                type="button"
-                className={`project-instructions-chip${instructionsMode !== 'closed' ? ' is-open' : ''}`}
-                data-testid="project-instructions-chip"
-                title={t('project.customInstructions')}
-                aria-expanded={instructionsMode !== 'closed'}
-                onClick={() => setInstructionsMode((m) => (m === 'closed' ? 'review' : 'closed'))}
-              >
-                <Icon name="file" size={11} />
-                <span>{t('project.customInstructions')}</span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="project-instructions-toggle"
-                data-testid="project-instructions-add"
-                title={t('project.customInstructions')}
-                aria-expanded={instructionsMode !== 'closed'}
-                onClick={() => {
-                  setInstructionsDraft('');
-                  setInstructionsMode((m) => (m === 'closed' ? 'edit' : 'closed'));
-                }}
-              >
-                <Icon name="edit" size={13} />
-              </button>
-            )}
-          </span>
-        </div>
-      </AppChromeHeader>
-      {instructionsMode === 'review' && (
-        <div className="project-instructions-bar project-instructions-review">
-          <div className="project-instructions-bar-head">
-            <label className="project-instructions-label">{t('project.customInstructions')}</label>
-            <span className="project-instructions-status">
-              <Icon name="check" size={11} />
-              {t('project.instructionsActive')}
-            </span>
-          </div>
-          <div className="project-instructions-preview" data-testid="project-instructions-preview">
-            {project.customInstructions}
-          </div>
-          <div className="project-instructions-actions">
-            <button
-              type="button"
-              className="btn-sm"
-              onClick={() => setInstructionsMode('closed')}
-            >
-              {t('common.close')}
-            </button>
-            <button
-              type="button"
-              className="btn-sm btn-primary"
-              data-testid="project-instructions-edit"
-              onClick={() => {
-                setInstructionsDraft(project.customInstructions ?? '');
-                setInstructionsMode('edit');
-              }}
-            >
-              {t('common.edit')}
-            </button>
-          </div>
-        </div>
-      )}
-      {instructionsMode === 'edit' && (
-        <div className="project-instructions-bar">
-          <label className="project-instructions-label">{t('project.customInstructions')}</label>
-          <textarea
-            className="project-instructions-input"
-            data-testid="project-instructions-textarea"
-            rows={3}
-            maxLength={5000}
-            placeholder={t('project.customInstructionsPlaceholder')}
-            value={instructionsDraft}
-            onChange={(e) => setInstructionsDraft(e.target.value)}
-            disabled={instructionsSaving}
-            autoFocus
-          />
-          <div className="project-instructions-actions">
-            <button type="button" className="btn-sm" disabled={instructionsSaving} onClick={() => {
-              setInstructionsDraft(project.customInstructions ?? '');
-              setInstructionsMode((project.customInstructions ?? '').trim() ? 'review' : 'closed');
-            }}>
-              {t('common.cancel')}
-            </button>
-            <button type="button" className="btn-sm btn-primary" data-testid="project-instructions-save" disabled={instructionsSaving} onClick={handleSaveInstructions}>
-              {t('common.save')}
-            </button>
-          </div>
-        </div>
-      )}
       {/* ProjectActionsToolbar removed per 00efdcba — hide finalize-design
           toolbar from project header. Restore from cf1cd9bb if product
           wants the Finalize + Continue-in-CLI buttons back in the chrome. */}
@@ -4009,6 +4251,7 @@ export function ProjectView({
         ref={splitRef}
         className={[
           projectSplitClassName(workspaceFocused),
+          leftInspectorActive && !workspaceFocused ? 'split-manual-edit' : '',
           resizingChatPanel && !workspaceFocused ? 'is-resizing-chat' : '',
         ].filter(Boolean).join(' ')}
         style={workspaceFocused
@@ -4019,7 +4262,13 @@ export function ProjectView({
             }}
       >
         <div className="split-chat-slot" hidden={workspaceFocused}>
-          {activeConversationId || conversationLoadError ? (
+          {commentInspectorActive ? (
+            <div
+              id={commentInspectorPortalId}
+              className="comment-left-host"
+              aria-label="Comments"
+            />
+          ) : activeConversationId || conversationLoadError ? (
             <ChatPane
               // The conversation id is part of the key so switching conversations
               // resets internal scroll/draft state inside ChatPane and ChatComposer.
@@ -4027,6 +4276,7 @@ export function ProjectView({
               messages={messages}
               streaming={currentConversationStreaming}
               sendDisabled={currentConversationSendDisabled}
+              queuedItems={currentConversationQueuedItems}
               error={conversationLoadError ?? error ?? audioVoiceOptionsError}
               projectId={project.id}
               projectKindForTracking={projectKindToTracking(project.metadata?.kind)}
@@ -4042,7 +4292,11 @@ export function ProjectView({
               onDetachComment={detachPreviewComment}
               onDeleteComment={(commentId) => void removePreviewComment(commentId)}
               onSend={handleSend}
+              onRetry={handleRetry}
               onStop={handleStop}
+              onRemoveQueuedSend={removeQueuedChatSend}
+              onUpdateQueuedSend={updateQueuedChatSend}
+              onSendQueuedNow={sendQueuedChatSendNow}
               onRequestOpenFile={requestOpenFile}
               onRequestPluginFolderAgentAction={handlePluginFolderAgentAction}
               activePluginActionPaths={activePluginActionPaths}
@@ -4061,9 +4315,15 @@ export function ProjectView({
               activeConversationId={activeConversationId}
               onSelectConversation={handleSelectConversation}
               onDeleteConversation={handleDeleteConversation}
-              onRenameConversation={handleRenameConversation}
               onOpenSettings={onOpenSettings}
+              onOpenAmrSettings={onOpenAmrSettings}
+              onSwitchToAmrAndRetry={handleSwitchToAmrAndRetry}
+              onLaunchAntigravityOauth={handleLaunchAntigravityOauth}
               onOpenMcpSettings={onOpenMcpSettings}
+              connectRepoNeeded={connectRepoNeeded}
+              githubConnected={githubConnected}
+              onConnectRepo={handleConnectRepo}
+              composerDraftSignal={composerDraftSignal}
               petConfig={config.pet}
               onAdoptPet={onAdoptPetInline}
               onTogglePet={onTogglePet}
@@ -4081,7 +4341,48 @@ export function ProjectView({
                 onProjectChange({ ...project, skillId });
               }}
               activePluginSnapshot={activePluginSnapshot}
-              onCollapse={() => setWorkspaceFocused(true)}
+              currentDesignSystemId={project.designSystemId}
+              onActiveDesignSystemChange={(updatedProject) => {
+                onProjectChange(updatedProject);
+              }}
+              onShowToast={(message) => {
+                setProjectActionsToast({ message, details: null });
+              }}
+              onBack={onBack}
+              backLabel={t('project.backToProjects')}
+              composerFooterAccessory={executionControls}
+              projectHeader={(
+                <span className="chat-project-title-line">
+                  <span
+                    className="title editable"
+                    data-testid="project-title"
+                    title={project.name}
+                    tabIndex={0}
+                    role="textbox"
+                    suppressContentEditableWarning
+                    contentEditable
+                    onBlur={(e) => handleProjectRename(e.currentTarget.textContent ?? '')}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        (e.currentTarget as HTMLElement).blur();
+                      }
+                    }}
+                  >
+                    {project.name}
+                  </span>
+                  {projectMeta !== t('project.metaFreeform') ? (
+                    <span className="meta" data-testid="project-meta">{projectMeta}</span>
+                  ) : null}
+                </span>
+              )}
+              designSystemPicker={(
+                <ProjectDesignSystemPicker
+                  designSystems={designSystems}
+                  selectedId={project.designSystemId ?? null}
+                  onChange={handleChangeDesignSystemId}
+                />
+              )}
             />
           ) : (
             <div className="pane" data-testid="chat-pane-loading">
@@ -4090,20 +4391,24 @@ export function ProjectView({
           )}
         </div>
         {!workspaceFocused ? (
-          <div
-            className="split-resize-handle"
-            role="separator"
-            aria-orientation="vertical"
-            aria-label={chatResizeLabel}
-            aria-valuemin={chatPanelAriaMinWidth}
-            aria-valuemax={chatPanelMaxWidth}
-            aria-valuenow={chatPanelWidth}
-            tabIndex={0}
-            title={chatResizeLabel}
-            onPointerDown={handleChatResizePointerDown}
-            onKeyDown={handleChatResizeKeyDown}
-            onBlur={handleChatResizeBlur}
-          />
+          leftInspectorActive ? (
+            <div className="split-edit-divider" aria-hidden />
+          ) : (
+            <div
+              className="split-resize-handle"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label={chatResizeLabel}
+              aria-valuemin={chatPanelAriaMinWidth}
+              aria-valuemax={chatPanelMaxWidth}
+              aria-valuenow={chatPanelWidth}
+              tabIndex={0}
+              title={chatResizeLabel}
+              onPointerDown={handleChatResizePointerDown}
+              onKeyDown={handleChatResizeKeyDown}
+              onBlur={handleChatResizeBlur}
+            />
+          )
         ) : null}
         <FileWorkspace
           projectId={project.id}
@@ -4117,6 +4422,8 @@ export function ProjectView({
           isDeck={isDeck}
           onExportAsPptx={handleExportAsPptx}
           streaming={currentConversationActionDisabled}
+          commentQueueOnSend={commentQueueOnSend}
+          commentSendDisabled={currentConversationQueueDisabled}
           openRequest={openRequest}
           liveArtifactEvents={liveArtifactEvents}
           designSystemActivityEvents={designSystemActivityEvents}
@@ -4131,9 +4438,37 @@ export function ProjectView({
           focusMode={workspaceFocused}
           onFocusModeChange={setWorkspaceFocused}
           designSystemProject={designSystemProject}
+          defaultDesignSystemId={config.designSystemId}
+          onSetDefaultDesignSystem={onChangeDefaultDesignSystem}
+          onDesignSystemsRefresh={onDesignSystemsRefresh}
           onDesignSystemNeedsWork={sendDesignSystemFeedback}
           designSystemReview={project.metadata?.designSystemReview}
           onDesignSystemReviewDecision={persistDesignSystemReviewDecision}
+          onConnectRepo={handleConnectRepo}
+          githubConnected={githubConnected}
+          commentPortalId={commentInspectorPortalId}
+          onCommentModeChange={setCommentInspectorActive}
+          messages={messages}
+          artifactHtml={artifact?.html}
+          conversationError={error}
+          onRetry={handleRetry}
+          onAuthorizeAndRetry={handleSwitchToAmrAndRetry}
+          onLaunchTerminalAuth={handleLaunchAntigravityOauth}
+          conversationId={activeConversationId}
+          headerActions={(
+            <>
+              <button
+                type="button"
+                className="settings-icon-btn"
+                onClick={() => onOpenSettings('execution')}
+                title={t('chat.cliSettingsTitle')}
+                aria-label={t('chat.cliSettingsAria')}
+              >
+                <Icon name="settings" size={16} />
+              </button>
+              <HandoffButton projectId={project.id} />
+            </>
+          )}
         />
       </div>
       {projectActionsToast ? (
@@ -4204,6 +4539,68 @@ export function findExistingArtifactProjectFile(
   return currentRunFiles.find((file) => file.name === candidateFileName) ?? null;
 }
 
+export function selectPrimaryProjectFile(files: ProjectFile[]): ProjectFile | null {
+  const candidates = files
+    .filter((file) => !isProcessArtifactFile(file.name))
+    .map((file) => ({ file, rank: primaryProjectFileRank(file) }))
+    .filter((candidate) => Number.isFinite(candidate.rank));
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => a.rank - b.rank || b.file.mtime - a.file.mtime);
+  return candidates[0]?.file ?? null;
+}
+
+function isProcessArtifactFile(name: string): boolean {
+  const base = name.split('/').pop()?.toLowerCase() ?? name.toLowerCase();
+  return (
+    base === 'critique.json'
+    || base.endsWith('.log')
+    || base.endsWith('.meta.json')
+    || base.endsWith('.artifact.json')
+    || base.endsWith('.map')
+  );
+}
+
+function primaryProjectFileRank(file: ProjectFile): number {
+  if (manifestDeclaresPrimary(file)) return 0;
+  if (file.artifactManifest && file.artifactManifest.metadata?.inferred !== true) return 1;
+  if (file.kind === 'html') return 2;
+  if (file.kind === 'image') return 3;
+  if (file.kind === 'video') return 4;
+  if (file.kind === 'sketch') return 5;
+  if (file.kind === 'pdf') return 6;
+  if (file.kind === 'presentation') return 7;
+  if (file.kind === 'document') return 8;
+  if (file.kind === 'spreadsheet') return 9;
+  return Number.POSITIVE_INFINITY;
+}
+
+function manifestDeclaresPrimary(file: ProjectFile): boolean {
+  const manifest = file.artifactManifest;
+  if (!manifest) return false;
+  if (primaryValueTargetsFile(manifest.primary, file.name)) return true;
+  const metadata = manifest.metadata;
+  if (!metadata || typeof metadata !== 'object') return false;
+  if (primaryValueTargetsFile(metadata.primary, file.name)) return true;
+  const outputs = metadata.outputs;
+  if (outputs && typeof outputs === 'object' && !Array.isArray(outputs)) {
+    return primaryValueTargetsFile(
+      (outputs as { primary?: unknown }).primary,
+      file.name,
+    );
+  }
+  return false;
+}
+
+function primaryValueTargetsFile(value: unknown, fileName: string): boolean {
+  if (value === true) return true;
+  if (typeof value !== 'string') return false;
+  return normalizeProjectFileName(value) === normalizeProjectFileName(fileName);
+}
+
+function normalizeProjectFileName(value: string): string {
+  return value.replace(/\\/g, '/').replace(/^\.?\//, '').toLowerCase();
+}
+
 function assistantAgentDisplayName(
   agentId: string | null,
   fallbackName?: string,
@@ -4217,6 +4614,35 @@ function isTerminalRunStatus(status: ChatMessage['runStatus']): boolean {
 
 function isActiveRunStatus(status: ChatMessage['runStatus']): boolean {
   return status === 'queued' || status === 'running';
+}
+
+export interface RetryTarget {
+  failedAssistant: ChatMessage;
+  userMsg: ChatMessage;
+  priorMessages: ChatMessage[];
+}
+
+export function resolveRetryTarget(
+  messages: ChatMessage[],
+  failedAssistantId: string,
+): RetryTarget | null {
+  const failedIndex = messages.findIndex(
+    (message) =>
+      message.id === failedAssistantId &&
+      message.role === 'assistant' &&
+      message.runStatus === 'failed',
+  );
+  if (failedIndex <= 0 || failedIndex !== messages.length - 1) return null;
+
+  const userMsg = messages[failedIndex - 1];
+  const failedAssistant = messages[failedIndex];
+  if (!userMsg || userMsg.role !== 'user' || !failedAssistant) return null;
+
+  return {
+    failedAssistant,
+    userMsg,
+    priorMessages: messages.slice(0, failedIndex - 1),
+  };
 }
 
 function latestDesignSystemActivityEvents(messages: ChatMessage[]): AgentEvent[] {
@@ -4367,6 +4793,27 @@ export function resolveSucceededRunStatus(status: ChatMessage['runStatus']): Cha
   return status === 'failed' || status === 'canceled' ? status : 'succeeded';
 }
 
+export function computeProducedFiles(
+  beforeNames: ReadonlySet<string> | readonly string[] | undefined,
+  next: readonly ProjectFile[],
+): ProjectFile[] | undefined {
+  if (!beforeNames) return undefined;
+  const set = beforeNames instanceof Set ? beforeNames : new Set(beforeNames);
+  return filterImplicitProducedFiles(next.filter((f) => !set.has(f.name)));
+}
+
+// Reattach with a recovered (on-disk) artifact must still include any
+// other files the turn produced before the artifact write — replacing
+// the diff with a single file was the regression noted on PR #2383.
+export function mergeRecoveredArtifact(
+  diff: readonly ProjectFile[],
+  recovered: ProjectFile | null,
+): ProjectFile[] {
+  if (!recovered) return [...diff];
+  if (diff.some((f) => f.name === recovered.name)) return [...diff];
+  return [...diff, recovered];
+}
+
 export function clearStreamingConversationMarker(
   currentConversationId: string | null,
   completedConversationId?: string | null,
@@ -4413,10 +4860,15 @@ type BufferedTextUpdates = ReturnType<typeof createBufferedTextUpdates>;
 function createBufferedTextUpdates({
   updateMessage,
   persistSoon,
+  flushAndPersistNow,
   onContentDelta,
 }: {
   updateMessage: (updater: (prev: ChatMessage) => ChatMessage) => void;
   persistSoon: () => void;
+  // Synchronous flush + persist with a transport that survives page
+  // unload (PUT with keepalive). Invoked by the pagehide handler so the
+  // last buffered chunk isn't lost when the user reloads mid-stream.
+  flushAndPersistNow?: () => void;
   onContentDelta?: (delta: string) => void;
 }) {
   let pendingContentDelta = '';
@@ -4427,6 +4879,7 @@ function createBufferedTextUpdates({
   let flushing = false;
   let needsFlush = false;
   const hasDocument = typeof document !== 'undefined';
+  const hasWindow = typeof window !== 'undefined';
 
   const cancelScheduledFlush = () => {
     if (flushFrame !== null) {
@@ -4518,6 +4971,9 @@ function createBufferedTextUpdates({
     if (hasDocument) {
       document.removeEventListener('visibilitychange', onVisibilityChange);
     }
+    if (hasWindow) {
+      window.removeEventListener('pagehide', onPageHide);
+    }
   };
 
   function onVisibilityChange() {
@@ -4526,8 +4982,18 @@ function createBufferedTextUpdates({
     }
   }
 
+  function onPageHide() {
+    flush();
+    // persistSoon's 500ms debounce never fires once the document tears
+    // down, so synchronously PUT with keepalive instead.
+    flushAndPersistNow?.();
+  }
+
   if (hasDocument) {
     document.addEventListener('visibilitychange', onVisibilityChange);
+  }
+  if (hasWindow) {
+    window.addEventListener('pagehide', onPageHide);
   }
 
   return { appendContent, appendTextEvent, appendEvent, flush, cancel };

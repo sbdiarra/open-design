@@ -4,13 +4,51 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { FileWorkspace, scrollWorkspaceTabsWithWheel } from '../../src/components/FileWorkspace';
 import { DesignFilesPanel } from '../../src/components/DesignFilesPanel';
 import { projectSplitClassName } from '../../src/components/ProjectView';
-import { uploadProjectFiles } from '../../src/providers/registry';
-import type { ProjectFile } from '../../src/types';
+import {
+  fetchProjectFileText,
+  uploadProjectFiles,
+  writeProjectTextFile,
+} from '../../src/providers/registry';
+import type { ChatMessage, ProjectFile } from '../../src/types';
+
+vi.mock('../../src/components/AmrGuidance', () => ({
+  AmrGuidance: ({
+    errorCode,
+    projectId,
+    projectKind,
+    conversationId,
+    assistantMessageId,
+    runId,
+    onActivate,
+  }: {
+    errorCode: string;
+    projectId: string;
+    projectKind: string | null;
+    conversationId: string | null;
+    assistantMessageId: string;
+    runId: string | null;
+    onActivate?: (() => void) | undefined;
+  }) => (
+    <div
+      data-testid="mock-amr-guidance"
+      data-error-code={errorCode}
+      data-project-id={projectId}
+      data-project-kind={projectKind ?? ''}
+      data-conversation-id={conversationId ?? ''}
+      data-assistant-message-id={assistantMessageId}
+      data-run-id={runId ?? ''}
+    >
+      <button type="button" data-testid="mock-amr-guidance-activate" onClick={onActivate}>
+        Switch to AMR
+      </button>
+    </div>
+  ),
+}));
 
 vi.mock('../../src/providers/registry', async () => {
   const actual = await vi.importActual<typeof import('../../src/providers/registry')>(
@@ -18,16 +56,29 @@ vi.mock('../../src/providers/registry', async () => {
   );
   return {
     ...actual,
+    fetchProjectFileText: vi.fn(),
     uploadProjectFiles: vi.fn(),
+    writeProjectTextFile: vi.fn(),
   };
 });
 
+const mockedFetchProjectFileText = vi.mocked(fetchProjectFileText);
 const mockedUploadProjectFiles = vi.mocked(uploadProjectFiles);
+const mockedWriteProjectTextFile = vi.mocked(writeProjectTextFile);
 
 let root: Root | null = null;
 let host: HTMLDivElement | null = null;
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+// Needed else the ResizeObserver in SketchEditor crashes the test
+beforeAll(() => {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    disconnect() {}
+    unobserve() {}
+  };
+});
 
 afterEach(() => {
   cleanup();
@@ -65,6 +116,25 @@ function workspaceFile(name: string): ProjectFile {
     mtime: 1700000000,
     kind: name.endsWith('.html') ? 'html' : 'text',
     mime: name.endsWith('.html') ? 'text/html' : 'text/plain',
+  };
+}
+
+function failedAssistantMessage(
+  code: string,
+  agentId: string,
+  detail = 'Recovered upstream failure',
+): ChatMessage {
+  return {
+    id: `msg-${code.toLowerCase()}`,
+    role: 'assistant',
+    content: '',
+    createdAt: 1700000000,
+    startedAt: 1700000000,
+    runId: `run-${code.toLowerCase()}`,
+    runStatus: 'failed',
+    agentId,
+    preTurnFileNames: [],
+    events: [{ kind: 'status', label: 'error', detail, code }],
   };
 }
 
@@ -132,6 +202,44 @@ function changeInputValue(input: HTMLInputElement, value: string) {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
   setter?.call(input, value);
   input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function renderDesignFilesPanel(overrides: Partial<React.ComponentProps<typeof DesignFilesPanel>> = {}) {
+  const props: React.ComponentProps<typeof DesignFilesPanel> = {
+    projectId: 'project-1',
+    files: [],
+    liveArtifacts: [],
+    onRefreshFiles: vi.fn(),
+    onOpenFile: vi.fn(),
+    onOpenLiveArtifact: vi.fn(),
+    onRenameFile: vi.fn(),
+    onDeleteFile: vi.fn(),
+    onDeleteFiles: vi.fn(),
+    onUpload: vi.fn(),
+    onUploadFiles: vi.fn(),
+    onPaste: vi.fn(),
+    onNewSketch: vi.fn(),
+    ...overrides,
+  };
+  return render(<DesignFilesPanel {...props} />);
+}
+
+function unreadableDropDataTransfer(fallbackFiles: File[] = []) {
+  return {
+    files: fallbackFiles,
+    items: [
+      {
+        webkitGetAsEntry: () => ({
+          isFile: true,
+          isDirectory: false,
+          name: 'stale.png',
+          file: (_done: (file: File) => void, fail?: (error: DOMException) => void) => {
+            fail?.(new DOMException('missing', 'NotFoundError'));
+          },
+        }),
+      },
+    ],
+  };
 }
 
 describe('FileWorkspace upload input', () => {
@@ -243,6 +351,81 @@ describe('FileWorkspace upload input', () => {
     });
   });
 
+  it('clears a prior upload failure after a later successful upload', async () => {
+    mockedUploadProjectFiles
+      .mockRejectedValueOnce(new Error('storage offline'))
+      .mockResolvedValueOnce({
+        uploaded: [
+          {
+            path: 'retry.png',
+            name: 'retry.png',
+            kind: 'image',
+            size: 1024,
+          },
+        ],
+        failed: [],
+      });
+
+    const onRefreshFiles = vi.fn();
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        files={[baseFile({ name: 'retry.png', path: 'retry.png' })]}
+        liveArtifacts={[]}
+        onRefreshFiles={onRefreshFiles}
+        isDeck={false}
+        tabsState={{ tabs: [], active: null }}
+        onTabsStateChange={vi.fn()}
+      />,
+    );
+
+    const input = screen.getByTestId('design-files-upload-input');
+    fireEvent.change(input, {
+      target: { files: [new File(['failed'], 'failed.png', { type: 'image/png' })] },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('upload-error-banner').textContent).toContain('storage offline');
+    });
+
+    fireEvent.change(input, {
+      target: { files: [new File(['retry'], 'retry.png', { type: 'image/png' })] },
+    });
+
+    await waitFor(() => expect(onRefreshFiles).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByTestId('upload-error-banner')).toBeNull());
+  });
+
+  it('falls back to the browser file list when a dragged entry cannot be read', async () => {
+    const fallbackFile = new File(['mock'], 'fallback.png', { type: 'image/png' });
+    const onUploadFiles = vi.fn();
+    const { container } = renderDesignFilesPanel({ onUploadFiles });
+
+    fireEvent.drop(container.querySelector('.df-drop')!, {
+      dataTransfer: unreadableDropDataTransfer([fallbackFile]),
+    });
+
+    await waitFor(() => expect(onUploadFiles).toHaveBeenCalledWith([fallbackFile]));
+    expect(screen.queryByTestId('upload-error-banner')).toBeNull();
+  });
+
+  it('shows a recoverable read error when a dragged entry disappears before import', async () => {
+    const onUploadFiles = vi.fn();
+    const { container } = renderDesignFilesPanel({ onUploadFiles });
+
+    fireEvent.drop(container.querySelector('.df-drop')!, {
+      dataTransfer: unreadableDropDataTransfer(),
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('upload-error-banner').textContent).toContain(
+        'Could not read one or more dropped files or folders',
+      );
+    });
+    expect(onUploadFiles).not.toHaveBeenCalled();
+  });
+
   it('hides the workspace focus control while the chat pane is open', () => {
     const markup = renderToStaticMarkup(
       <FileWorkspace
@@ -306,6 +489,213 @@ describe('FileWorkspace upload input', () => {
     );
 
     expect(markup).toContain('Show chat');
+  });
+});
+
+describe('FileWorkspace generation failure recovery', () => {
+  it('surfaces authorize-and-retry on the failed preview surface for AMR auth failures', () => {
+    const onAuthorizeAndRetry = vi.fn();
+
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        files={[]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: [], active: null }}
+        onTabsStateChange={vi.fn()}
+        messages={[failedAssistantMessage('AMR_AUTH_REQUIRED', 'amr', 'AMR auth expired')]}
+        onAuthorizeAndRetry={onAuthorizeAndRetry}
+      />,
+    );
+
+    expect(screen.getByTestId('generation-preview-stage')).toBeTruthy();
+    expect(screen.getByTestId('generation-preview-authorize').textContent).toContain('Authorize');
+    expect(screen.queryByTestId('mock-amr-guidance')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('generation-preview-authorize'));
+
+    expect(onAuthorizeAndRetry).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'msg-amr_auth_required', agentId: 'amr' }),
+    );
+  });
+
+  it('surfaces the AMR promotion card and retry action for non-AMR rate-limited failures', () => {
+    const onRetry = vi.fn();
+    const onAuthorizeAndRetry = vi.fn();
+
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        files={[]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: [], active: null }}
+        onTabsStateChange={vi.fn()}
+        messages={[failedAssistantMessage('RATE_LIMITED', 'claude', 'Claude quota exhausted')]}
+        onRetry={onRetry}
+        onAuthorizeAndRetry={onAuthorizeAndRetry}
+        conversationId="conv-1"
+      />,
+    );
+
+    expect(screen.getByTestId('generation-preview-stage')).toBeTruthy();
+    expect(screen.getByTestId('generation-preview-retry')).toBeTruthy();
+    const guidance = screen.getByTestId('mock-amr-guidance');
+    expect(guidance.getAttribute('data-error-code')).toBe('RATE_LIMITED');
+    expect(guidance.getAttribute('data-project-id')).toBe('project-1');
+    expect(guidance.getAttribute('data-project-kind')).toBe('prototype');
+    expect(guidance.getAttribute('data-conversation-id')).toBe('conv-1');
+    expect(guidance.getAttribute('data-assistant-message-id')).toBe('msg-rate_limited');
+    expect(guidance.getAttribute('data-run-id')).toBe('run-rate_limited');
+
+    fireEvent.click(screen.getByTestId('generation-preview-retry'));
+    fireEvent.click(screen.getByTestId('mock-amr-guidance-activate'));
+
+    expect(onRetry).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'msg-rate_limited', agentId: 'claude' }),
+    );
+    expect(onAuthorizeAndRetry).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'msg-rate_limited', agentId: 'claude' }),
+    );
+  });
+
+  it('suppresses the AMR promotion card for upstream outages while keeping retry available', () => {
+    const onRetry = vi.fn();
+    const onAuthorizeAndRetry = vi.fn();
+
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        files={[]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: [], active: null }}
+        onTabsStateChange={vi.fn()}
+        messages={[failedAssistantMessage('UPSTREAM_UNAVAILABLE', 'claude', 'Model provider unavailable')]}
+        onRetry={onRetry}
+        onAuthorizeAndRetry={onAuthorizeAndRetry}
+        conversationId="conv-1"
+      />,
+    );
+
+    expect(screen.getByTestId('generation-preview-stage')).toBeTruthy();
+    expect(screen.getByTestId('generation-preview-retry')).toBeTruthy();
+    expect(screen.queryByTestId('mock-amr-guidance')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('generation-preview-retry'));
+
+    expect(onRetry).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'msg-upstream_unavailable', agentId: 'claude' }),
+    );
+    expect(onAuthorizeAndRetry).not.toHaveBeenCalled();
+  });
+
+  it('surfaces recharge and retry actions on the failed preview surface for AMR balance errors', () => {
+    const onRetry = vi.fn();
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        files={[]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: [], active: null }}
+        onTabsStateChange={vi.fn()}
+        messages={[failedAssistantMessage('AMR_INSUFFICIENT_BALANCE', 'amr', 'AMR balance empty')]}
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId('generation-preview-stage')).toBeTruthy();
+    expect(screen.getByTestId('generation-preview-recharge').textContent).toContain('Top up AMR');
+    expect(screen.getByTestId('generation-preview-retry')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('generation-preview-recharge'));
+    fireEvent.click(screen.getByTestId('generation-preview-retry'));
+
+    expect(openSpy).toHaveBeenCalledWith(
+      'https://open-design.ai/amr/wallet',
+      '_blank',
+      'noopener,noreferrer',
+    );
+    expect(onRetry).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'msg-amr_insufficient_balance', agentId: 'amr' }),
+    );
+  });
+
+  it('wires the terminal auth launcher and retry to the failed assistant for antigravity auth failures', () => {
+    const onRetry = vi.fn();
+    const onLaunchTerminalAuth = vi.fn();
+
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        files={[]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: [], active: null }}
+        onTabsStateChange={vi.fn()}
+        messages={[failedAssistantMessage('AGENT_AUTH_REQUIRED', 'antigravity', 'Sign in with agy first')]}
+        onRetry={onRetry}
+        onLaunchTerminalAuth={onLaunchTerminalAuth}
+      />,
+    );
+
+    expect(screen.getByTestId('generation-preview-launch-terminal')).toBeTruthy();
+    expect(screen.getByTestId('generation-preview-retry')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('generation-preview-launch-terminal'));
+    fireEvent.click(screen.getByTestId('generation-preview-retry'));
+
+    expect(onLaunchTerminalAuth).toHaveBeenCalledTimes(1);
+    expect(onRetry).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'msg-agent_auth_required', agentId: 'antigravity' }),
+    );
+  });
+
+  it('wires the terminal model-switch launcher and retry to the failed assistant for antigravity rate limits', () => {
+    const onRetry = vi.fn();
+    const onLaunchTerminalAuth = vi.fn();
+
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        files={[]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: [], active: null }}
+        onTabsStateChange={vi.fn()}
+        messages={[failedAssistantMessage('RATE_LIMITED', 'antigravity', 'Switch agy models in the terminal')]}
+        onRetry={onRetry}
+        onLaunchTerminalAuth={onLaunchTerminalAuth}
+      />,
+    );
+
+    expect(screen.getByTestId('generation-preview-launch-terminal')).toBeTruthy();
+    expect(screen.getByTestId('generation-preview-retry')).toBeTruthy();
+    expect(screen.queryByTestId('mock-amr-guidance')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('generation-preview-launch-terminal'));
+    fireEvent.click(screen.getByTestId('generation-preview-retry'));
+
+    expect(onLaunchTerminalAuth).toHaveBeenCalledTimes(1);
+    expect(onRetry).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'msg-rate_limited', agentId: 'antigravity' }),
+    );
   });
 });
 
@@ -676,5 +1066,73 @@ describe('scrollWorkspaceTabsWithWheel', () => {
 
     expect(currentTarget.scrollLeft).toBe(200);
     expect(preventDefault).not.toHaveBeenCalled();
+  });
+});
+
+describe('FileWorkspace sketch save', () => {
+  it('keeps saving state visible for at least 500ms', async () => {
+    // Simulate user doing some edits in the workspace
+    const file: ProjectFile = {
+      name: 'test.sketch.json',
+      path: 'test.sketch.json',
+      type: 'file',
+      size: 100,
+      mtime: 1700000000,
+      kind: 'sketch',
+      mime: 'application/json',
+    };
+
+    mockedFetchProjectFileText.mockResolvedValue(
+      JSON.stringify({
+        version: 1,
+        items: [
+          { kind: 'pen', points: [{ x: 10, y: 20 }], color: '#000', size: 2 },
+        ],
+      }),
+    );
+    mockedWriteProjectTextFile.mockResolvedValue(file);
+
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        files={[file]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: ['test.sketch.json'], active: 'test.sketch.json' }}
+        onTabsStateChange={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector('canvas')).not.toBeNull();
+    });
+
+    vi.useFakeTimers();
+
+    const btn = screen.getByText('Save') as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(btn);
+    });
+
+    expect(btn.textContent).toBe('Saving…');
+    expect(btn.disabled).toBe(true);
+
+    // Before the 500ms floor is reached, still saving
+    await act(async () => {
+      vi.advanceTimersByTime(400);
+    });
+    expect(btn.textContent).toBe('Saving…');
+    expect(btn.disabled).toBe(true);
+
+    // After 500ms total, saving should end and the checkmark should appear
+    await act(async () => {
+      vi.advanceTimersByTime(100);
+    });
+    expect(btn.textContent).not.toBe('Saving…');
+    expect(btn.querySelector('svg')).not.toBeNull();
   });
 });

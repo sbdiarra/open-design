@@ -132,6 +132,7 @@ vi.mock('../../src/components/ChatPane', () => ({
   ChatPane: ({
     messages,
     onSend,
+    onRetry,
     error,
   }: {
     messages: ChatMessage[];
@@ -140,10 +141,21 @@ vi.mock('../../src/components/ChatPane', () => ({
       attachments: ChatAttachment[],
       commentAttachments: ChatCommentAttachment[],
     ) => void;
+    onRetry?: (assistantMessage: ChatMessage) => void;
     error?: string | null;
-  }) => (
-    <div>
-      {error ? <div>{error}</div> : null}
+  }) => {
+    const lastMessage = messages[messages.length - 1];
+    const retryMessage = lastMessage?.role === 'assistant' && lastMessage.runStatus === 'failed'
+      ? lastMessage
+      : null;
+    return (
+      <div>
+        {error ? <div>{error}</div> : null}
+        {error && retryMessage && onRetry ? (
+          <button type="button" onClick={() => onRetry(retryMessage)}>
+            retry
+          </button>
+        ) : null}
       <button
         type="button"
         onClick={() => onSend('Create a login page', chatPaneMockState.attachments, chatPaneMockState.commentAttachments)}
@@ -162,8 +174,9 @@ vi.mock('../../src/components/ChatPane', () => ({
           ))}
         </article>
       ))}
-    </div>
-  ),
+      </div>
+    );
+  },
 }));
 
 const mockedStreamMessage = vi.mocked(streamMessage);
@@ -295,6 +308,40 @@ describe('ProjectView API empty response handling', () => {
     expect(mockedPlaySound).toHaveBeenCalledWith('failure-sound');
   });
 
+  it('retries a failed API turn without appending a duplicate user message', async () => {
+    let callCount = 0;
+    mockedStreamMessage.mockImplementation(async (
+      _cfg: AppConfig,
+      _system: string,
+      _history: ChatMessage[],
+      _signal: AbortSignal,
+      handlers: StreamHandlers,
+    ) => {
+      callCount += 1;
+      if (callCount === 1) {
+        handlers.onError(new Error('model crashed'));
+      }
+    });
+    renderProjectView();
+
+    await sendTestPrompt();
+
+    await waitFor(() => expect(screen.getByText('model crashed')).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'retry' }));
+
+    await waitFor(() => expect(mockedStreamMessage).toHaveBeenCalledTimes(2));
+    const retryHistory = mockedStreamMessage.mock.calls[1]![2] as ChatMessage[];
+    expect(retryHistory.map((message) => `${message.role}:${message.content}`)).toEqual([
+      'user:Create a login page',
+    ]);
+    expect(
+      mockedSaveMessage.mock.calls.filter((call) => {
+        const message = call[2] as ChatMessage;
+        return message.role === 'user' && message.content === 'Create a login page';
+      }),
+    ).toHaveLength(1);
+  });
+
   it('renders the workspace without the removed project action toolbar', async () => {
     renderProjectView();
 
@@ -423,6 +470,31 @@ describe('ProjectView API empty response handling', () => {
     expect(userMessage?.content).toContain('brief.docx');
     expect(userMessage?.content).toContain('Hello world');
     expect(userMessage?.content).toContain('Second line');
+  });
+
+  it('includes saved project instructions in the BYOK system prompt for the next run', async () => {
+    let capturedSystemPrompt = '';
+    mockedStreamMessage.mockImplementation(async (
+      _cfg: AppConfig,
+      system: string,
+      _history: ChatMessage[],
+      _signal: AbortSignal,
+      handlers: StreamHandlers,
+    ) => {
+      capturedSystemPrompt = system;
+      handlers.onDelta('ok');
+      handlers.onDone('ok');
+    });
+
+    renderProjectView({
+      ...project,
+      customInstructions: 'Use tabs for indentation and keep CTA copy terse.',
+    });
+
+    await sendTestPrompt();
+
+    await waitFor(() => expect(capturedSystemPrompt).toContain('## Custom instructions (project-level)'));
+    expect(capturedSystemPrompt).toContain('Use tabs for indentation and keep CTA copy terse.');
   });
 
   it('plays the success sound for API completions that become succeeded after starting without runStatus', async () => {

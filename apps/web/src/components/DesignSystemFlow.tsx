@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
+import { Button, Textarea } from '@open-design/components';
 import type { ConnectorConnectResponse, ConnectorDetail, ConnectorStatusResponse } from '@open-design/contracts';
 import { streamViaDaemon } from '../providers/daemon';
 import {
@@ -21,6 +22,7 @@ import {
 } from '../providers/registry';
 import {
   createConversation,
+  getProject,
   listConversations,
   listMessages,
   loadTabs,
@@ -36,6 +38,11 @@ import {
 } from '../runtime/design-system-package-audit';
 import { deriveFileOps } from '../runtime/file-ops';
 import { latestTodosFromEvents } from '../runtime/todos';
+import {
+  createFileSystemReadError,
+  FILE_SYSTEM_READ_ERROR_MESSAGE,
+  isFileSystemReadError,
+} from '../utils/fileSystemErrors';
 import { randomUUID } from '../utils/uuid';
 import type {
   AgentEvent,
@@ -58,6 +65,7 @@ import { decideAutoOpenAfterWrite } from './auto-open-file';
 import { ChatPane } from './ChatPane';
 import { FileWorkspace } from './FileWorkspace';
 import { Icon, type IconName } from './Icon';
+import { Spinner } from './Loading';
 import { useAnalytics } from '../analytics/provider';
 import {
   trackDesignSystemCreateResult,
@@ -93,6 +101,7 @@ import type {
   TrackingDesignSystemStatusValue,
   TrackingDesignSystemsEntryFrom,
 } from '@open-design/contracts/analytics';
+import { useI18n } from '../i18n';
 
 // Source counts the embedded DS creation flow can report back to its
 // wrapper at Generate-click time. OnboardingView uses this to emit the
@@ -134,6 +143,13 @@ interface CreationProps {
   ) => void;
 }
 
+const SOURCE_PROCESSING_MIN_VISIBLE_MS = 900;
+const SOURCE_PROCESSING_LOADING_FILE_COUNT = 24;
+const SOURCE_PROCESSING_LOADING_BYTES = 4 * 1024 * 1024;
+const SOURCE_FILE_DIALOG_FOCUS_DELAY_MS = 120;
+const SOURCE_FILE_DIALOG_WARMUP_MS = 450;
+const SOURCE_FILE_DIALOG_STALE_MS = 30_000;
+
 interface DetailProps {
   id: string;
   selectedId: string | null;
@@ -148,6 +164,11 @@ interface DetailProps {
 
 type SetupStep = 'setup' | 'confirm';
 type ReviewTab = 'system' | 'files';
+
+interface ResolvedDesignSystemWorkspaceProject {
+  projectId: string;
+  files: ProjectFile[];
+}
 
 interface SetupState {
   company: string;
@@ -238,6 +259,26 @@ function readRememberedGenerationJob(designSystemId: string): string | null {
   }
 }
 
+async function resolveDesignSystemWorkspaceProject(
+  system: Pick<DesignSystemDetail, 'id' | 'projectId'>,
+): Promise<ResolvedDesignSystemWorkspaceProject | null> {
+  const workspace = await ensureDesignSystemWorkspace(system.id);
+  if (workspace) {
+    return {
+      projectId: workspace.project.id,
+      files: workspace.files,
+    };
+  }
+  if (!system.projectId) return null;
+  const fallbackProject = await getProject(system.projectId);
+  if (!fallbackProject) return null;
+  const files = await fetchProjectFiles(system.projectId);
+  return {
+    projectId: system.projectId,
+    files,
+  };
+}
+
 function clearRememberedGenerationJob(designSystemId: string): void {
   try {
     window.sessionStorage.removeItem(generationJobStorageKey(designSystemId));
@@ -261,6 +302,7 @@ export function DesignSystemCreationFlow({
   const [state, setState] = useState<SetupState>(EMPTY_SETUP);
   const [error, setError] = useState<string | null>(null);
   const [generationStarting, setGenerationStarting] = useState(false);
+  const [sourceProcessingCount, setSourceProcessingCount] = useState(0);
   const composioConfigured = isComposioConfigured(config?.composio);
   const [githubConnector, setGithubConnector] = useState<ConnectorDetail | null>(null);
   const [githubConnectorLoading, setGithubConnectorLoading] = useState(false);
@@ -442,6 +484,16 @@ export function DesignSystemCreationFlow({
     }));
   }
 
+  function beginSourceProcessing() {
+    setSourceProcessingCount((count) => count + 1);
+    let ended = false;
+    return () => {
+      if (ended) return;
+      ended = true;
+      setSourceProcessingCount((count) => Math.max(0, count - 1));
+    };
+  }
+
   async function handlePickCodeFolder() {
     const selected = await openFolderDialog();
     if (!selected) return;
@@ -456,6 +508,14 @@ export function DesignSystemCreationFlow({
       ...curr,
       codeFolders: curr.codeFolders.filter((item) => item !== folder),
       ...(curr.codeFolders.includes(folder) ? {} : { codeFiles: [], codeFileObjects: [] }),
+    }));
+  }
+
+  function handleRemoveAssetFile(name: string) {
+    setState((curr) => ({
+      ...curr,
+      assetFiles: curr.assetFiles.filter((item) => item !== name),
+      assetFileObjects: curr.assetFileObjects.filter((file) => resourceRelativePath(file) !== name),
     }));
   }
 
@@ -592,19 +652,18 @@ export function DesignSystemCreationFlow({
           <h1>It will take about 5 minutes to generate your design system.</h1>
           <p>You can step away. Keep the tab open in the background.</p>
           <div className="ds-setup-actions">
-            <button type="button" className="ghost" onClick={() => setStep('setup')}>
+            <Button variant="ghost" onClick={() => setStep('setup')}>
               <Icon name="arrow-left" />
               Back
-            </button>
-            <button
-              type="button"
-              className="primary"
+            </Button>
+            <Button
+              variant="primary"
               disabled={generationStarting}
               onClick={() => void generate()}
             >
               <Icon name="sparkles" />
               {generationStarting ? 'Opening project...' : 'Generate'}
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -613,18 +672,30 @@ export function DesignSystemCreationFlow({
 
   return (
     <div className={`ds-setup-shell${embedded ? ' ds-setup-shell--embedded' : ''}`}>
+      {sourceProcessingCount > 0 ? (
+        <div
+          className="ds-source-upload-loading"
+          role="status"
+          aria-live="polite"
+          data-testid="ds-source-upload-loading"
+        >
+          <div className="ds-source-upload-loading__card">
+            <Spinner size={18} />
+            <span>Adding source material...</span>
+          </div>
+        </div>
+      ) : null}
       {embedded ? null : (
         <header className="ds-setup-topbar">
-          <button type="button" className="ghost" onClick={onBack}>
+          <Button variant="ghost" onClick={onBack}>
             <Icon name="arrow-left" />
             Back
-          </button>
+          </Button>
           <span className="ds-setup-mark">
             <Icon name="blocks" />
           </span>
-          <button
-            type="button"
-            className="primary"
+          <Button
+            variant="primary"
             disabled={!state.company.trim()}
             onClick={() => {
               if (!state.company.trim()) {
@@ -636,7 +707,7 @@ export function DesignSystemCreationFlow({
           >
             Continue to generation
             <Icon name="chevron-right" />
-          </button>
+          </Button>
         </header>
       )}
 
@@ -714,6 +785,8 @@ export function DesignSystemCreationFlow({
               directory
               onBrowseFolder={() => void handlePickCodeFolder()}
               onRemoveName={handleRemoveCodeFolder}
+              onError={setError}
+              onProcessingStart={beginSourceProcessing}
               onFiles={(_names, files) => {
                 const stagedFiles = selectLocalCodeFiles(files);
                 const stagedNames = stagedFiles.map((file) => localCodeRelativePath(file));
@@ -731,6 +804,8 @@ export function DesignSystemCreationFlow({
               prompt="Drop .fig here or browse"
               accept=".fig"
               names={state.figFiles}
+              onError={setError}
+              onProcessingStart={beginSourceProcessing}
               onFiles={(_names, files) => {
                 const stagedFiles = selectFigmaFiles(files);
                 const stagedNames = stagedFiles.map((file) => resourceRelativePath(file));
@@ -746,6 +821,9 @@ export function DesignSystemCreationFlow({
               label="Add assets"
               prompt="Drag files here or browse"
               names={state.assetFiles}
+              onRemoveName={handleRemoveAssetFile}
+              onError={setError}
+              onProcessingStart={beginSourceProcessing}
               onFiles={(_names, files) => {
                 const stagedFiles = selectAssetFiles(files);
                 const stagedNames = stagedFiles.map((file) => resourceRelativePath(file));
@@ -763,7 +841,7 @@ export function DesignSystemCreationFlow({
         {embedded ? null : (
           <label className="ds-setup-field">
             <span>Notes</span>
-            <textarea
+            <Textarea
               rows={4}
               value={state.notes}
               onChange={(event) => setState((curr) => ({ ...curr, notes: event.target.value }))}
@@ -774,13 +852,12 @@ export function DesignSystemCreationFlow({
         {error ? <div className="ds-editor-error">{error}</div> : null}
         {embedded ? (
           <div className="ds-setup-actions ds-setup-actions--embedded">
-            <button type="button" className="ghost" onClick={onBack}>
+            <Button variant="ghost" onClick={onBack}>
               <Icon name="arrow-left" />
               Back
-            </button>
-            <button
-              type="button"
-              className="primary"
+            </Button>
+            <Button
+              variant="primary"
               disabled={!state.company.trim()}
               onClick={() => {
                 if (!state.company.trim()) {
@@ -792,7 +869,7 @@ export function DesignSystemCreationFlow({
             >
               Generate
               <Icon name="chevron-right" />
-            </button>
+            </Button>
           </div>
         ) : null}
       </main>
@@ -811,6 +888,7 @@ export function DesignSystemDetailView({
   onSystemsRefresh,
   onProjectsRefresh,
 }: DetailProps) {
+  const { locale } = useI18n();
   const [system, setSystem] = useState<DesignSystemDetail | null>(null);
   const [body, setBody] = useState('');
   const [tab, setTab] = useState<ReviewTab>('system');
@@ -825,6 +903,7 @@ export function DesignSystemDetailView({
   const [chatSeed, setChatSeed] = useState<{ id: string; text: string } | null>(null);
   const [workspaceProjectId, setWorkspaceProjectId] = useState<string | null>(null);
   const [workspaceProjectFiles, setWorkspaceProjectFiles] = useState<ProjectFile[]>([]);
+  const [workspaceLoadError, setWorkspaceLoadError] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [projectChatMessages, setProjectChatMessages] = useState<ChatMessage[]>([]);
@@ -840,6 +919,7 @@ export function DesignSystemDetailView({
   const pendingWorkspaceFileWritesRef = useRef<Map<string, string>>(new Map());
   const workspaceTabsLoadedRef = useRef(false);
   const openedProjectRef = useRef<string | null>(null);
+  const suppressedInitialConversationProjectIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
@@ -847,6 +927,7 @@ export function DesignSystemDetailView({
     setRevisions([]);
     setWorkspaceProjectId(null);
     setWorkspaceProjectFiles([]);
+    setWorkspaceLoadError(null);
     setConversations([]);
     setActiveConversationId(null);
     setProjectChatMessages([]);
@@ -856,6 +937,7 @@ export function DesignSystemDetailView({
     setWorkspaceOpenRequest(null);
     openedProjectRef.current = null;
     workspaceTabsLoadedRef.current = false;
+    suppressedInitialConversationProjectIdsRef.current.clear();
     pendingWorkspaceFileWritesRef.current.clear();
     void fetchDesignSystem(id).then((detail) => {
       if (cancelled) return;
@@ -872,18 +954,24 @@ export function DesignSystemDetailView({
   }, [id]);
 
   useEffect(() => {
-    if (!system || system.source !== 'user') return undefined;
-    const designSystemId = system.id;
+    if (!system) return undefined;
+    const currentSystem = system;
     let cancelled = false;
     async function syncWorkspaceProject() {
-      const workspace = await ensureDesignSystemWorkspace(designSystemId);
-      if (cancelled || !workspace) return;
-      setWorkspaceProjectId(workspace.project.id);
-      setWorkspaceProjectFiles(workspace.files);
-      if (onOpenProject && openedProjectRef.current !== workspace.project.id) {
-        openedProjectRef.current = workspace.project.id;
+      setWorkspaceLoadError(null);
+      const resolved = await resolveDesignSystemWorkspaceProject(currentSystem);
+      if (cancelled) return;
+      if (!resolved) {
+        setWorkspaceLoadError('Could not open the design system workspace.');
+        return;
+      }
+      const projectId = resolved.projectId;
+      setWorkspaceProjectId(projectId);
+      setWorkspaceProjectFiles(resolved.files);
+      if (onOpenProject && openedProjectRef.current !== projectId) {
+        openedProjectRef.current = projectId;
         await onProjectsRefresh?.();
-        if (!cancelled) onOpenProject(workspace.project.id);
+        if (!cancelled) onOpenProject(projectId);
       }
     }
     void syncWorkspaceProject();
@@ -895,6 +983,9 @@ export function DesignSystemDetailView({
   useEffect(() => {
     if (!workspaceProjectId) return undefined;
     const projectId = workspaceProjectId;
+    if (suppressedInitialConversationProjectIdsRef.current.delete(projectId)) {
+      return undefined;
+    }
     let cancelled = false;
     async function loadWorkspaceConversation() {
       const existing = await listConversations(projectId);
@@ -1214,14 +1305,17 @@ export function DesignSystemDetailView({
     });
   }
 
-  async function ensureWorkspaceProject() {
+  async function ensureWorkspaceProject(options?: { suppressInitialConversation?: boolean }) {
     if (!system) return workspaceProjectId;
     if (workspaceProjectId) return workspaceProjectId;
-    const workspace = await ensureDesignSystemWorkspace(system.id);
-    if (!workspace) return null;
-    setWorkspaceProjectId(workspace.project.id);
-    setWorkspaceProjectFiles(workspace.files);
-    return workspace.project.id;
+    const resolved = await resolveDesignSystemWorkspaceProject(system);
+    if (!resolved) return null;
+    if (options?.suppressInitialConversation) {
+      suppressedInitialConversationProjectIdsRef.current.add(resolved.projectId);
+    }
+    setWorkspaceProjectId(resolved.projectId);
+    setWorkspaceProjectFiles(resolved.files);
+    return resolved.projectId;
   }
 
   const refreshWorkspaceProjectFiles = useCallback(async (projectId: string) => {
@@ -1421,6 +1515,7 @@ export function DesignSystemDetailView({
         commentAttachments,
         model: selectedModel?.model ?? null,
         reasoning: selectedModel?.reasoning ?? null,
+        locale,
         analyticsHints: {
           entryFrom: wasOnboardingHandoff
             ? 'onboarding_design_system'
@@ -1564,6 +1659,7 @@ export function DesignSystemDetailView({
       ensureWorkspaceProject,
       feedbackSection,
       introChatMessages,
+      locale,
       onProjectsRefresh,
       persistProjectMessage,
       projectChatMessages,
@@ -1585,25 +1681,29 @@ export function DesignSystemDetailView({
   }, []);
 
   const createProjectChatConversation = useCallback(() => {
-    const projectId = workspaceProjectId;
-    if (!projectId) {
-      setChatSeed({
-        id: `general-${Date.now()}`,
-        text: 'Update this design system: ',
+    void (async () => {
+      const projectId = workspaceProjectId ?? await ensureWorkspaceProject({
+        suppressInitialConversation: true,
       });
-      return;
-    }
-    void createConversation(projectId, 'Design system').then((fresh) => {
-      if (!fresh) return;
+      if (!projectId) {
+        setChatError('Could not open the design system workspace.');
+        return;
+      }
+      const fresh = await createConversation(projectId, 'Design system');
+      if (!fresh) {
+        setChatError('Could not create a design system conversation.');
+        return;
+      }
       setConversations((current) => [fresh, ...current]);
       setActiveConversationId(fresh.id);
       setProjectChatMessages([]);
+      setChatError(null);
       setChatSeed({
         id: `general-${Date.now()}`,
         text: 'Update this design system: ',
       });
-    });
-  }, [workspaceProjectId]);
+    })();
+  }, [ensureWorkspaceProject, workspaceProjectId]);
 
   async function resolveRevision(
     revision: DesignSystemRevision,
@@ -1684,10 +1784,10 @@ export function DesignSystemDetailView({
 
       <main className="ds-review-main">
         <header className="ds-review-tabs">
-          <button type="button" className="ghost" onClick={onBack}>
+          <Button variant="ghost" onClick={onBack}>
             <Icon name="arrow-left" />
             Back
-          </button>
+          </Button>
           <div className="segmented">
             <button
               type="button"
@@ -1704,9 +1804,9 @@ export function DesignSystemDetailView({
               Design Files
             </button>
           </div>
-          <button type="button" className="ghost">
+          <Button variant="ghost">
             Share
-          </button>
+          </Button>
         </header>
 
         {tab === 'system' ? (
@@ -1732,9 +1832,9 @@ export function DesignSystemDetailView({
                 Published
               </label>
               {selectedId !== system.id ? (
-                <button
-                  type="button"
-                  className="ghost compact"
+                <Button
+                  variant="ghost"
+                  className="compact"
                   onClick={() => {
                     const statusBefore = mapDsStatusToTracking(system.status);
                     onSetDefault(system.id);
@@ -1754,7 +1854,7 @@ export function DesignSystemDetailView({
                   }}
                 >
                   Make default
-                </button>
+                </Button>
               ) : null}
             </div>
             <DesignSystemPackageCard system={system} />
@@ -1764,10 +1864,10 @@ export function DesignSystemDetailView({
                 <strong>Missing brand fonts</strong>
                 Open Design is rendering typography with substitute web fonts.
               </span>
-              <button type="button" className="ghost compact">
+              <Button variant="ghost" className="compact">
                 <Icon name="upload" />
                 Upload fonts
-              </button>
+              </Button>
             </div>
             {statusLine ? <div className="ds-status-line">{statusLine}</div> : null}
             <WorkspaceActivityCard message={workspaceActivityMessage} active={chatStreaming} />
@@ -1837,16 +1937,16 @@ export function DesignSystemDetailView({
             </div>
             <label className="ds-body-editor">
               DESIGN.md
-              <textarea
+              <Textarea
                 value={body}
                 onChange={(event) => setBody(event.target.value)}
                 rows={16}
                 disabled={!editable}
               />
             </label>
-            <button type="button" className="primary" disabled={!editable || saving} onClick={() => void saveBody()}>
+            <Button variant="primary" disabled={!editable || saving} onClick={() => void saveBody()}>
               Save DESIGN.md
-            </button>
+            </Button>
             {recentRevisions.length > 0 ? <RevisionHistoryList revisions={recentRevisions} /> : null}
           </div>
         ) : (
@@ -1866,6 +1966,8 @@ export function DesignSystemDetailView({
                 tabsState={workspaceTabsState}
                 onTabsStateChange={persistWorkspaceTabsState}
               />
+            ) : workspaceLoadError ? (
+              <div className="viewer-empty">{workspaceLoadError}</div>
             ) : (
               <div className="viewer-empty">Opening the design system workspace...</div>
             )}
@@ -2322,6 +2424,8 @@ interface DropZoneProps {
   directory?: boolean;
   onBrowseFolder?: () => void;
   onRemoveName?: (name: string) => void;
+  onError?: (message: string | null) => void;
+  onProcessingStart?: () => () => void;
   onFiles: (names: string[], files: File[]) => void;
 }
 interface WebkitFileSystemEntry {
@@ -2474,16 +2578,132 @@ function DropZone({
   directory,
   onBrowseFolder,
   onRemoveName,
+  onError,
+  onProcessingStart,
   onFiles,
 }: DropZoneProps) {
-  function readFiles(files: FileList | File[] | null) {
-    const nextFiles = Array.from(files ?? []);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const fileDialogPendingRef = useRef(false);
+  const fileDialogCanShowLoadingRef = useRef(false);
+  const fileDialogLoadingFinishRef = useRef<(() => void) | undefined>();
+  const fileDialogFocusDelayRef = useRef<number | undefined>();
+  const fileDialogWarmupRef = useRef<number | undefined>();
+  const fileDialogStaleRef = useRef<number | undefined>();
+
+  useEffect(() => {
+    if (!directory || !onProcessingStart) return undefined;
+    const input = inputRef.current;
+    const handleFocus = () => {
+      beginFileDialogReturnLoading();
+    };
+    const handleCancel = () => {
+      const finish = completeFileDialogTracking();
+      finishProcessingLater(finish);
+    };
+    window.addEventListener('focus', handleFocus);
+    input?.addEventListener('cancel', handleCancel);
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      input?.removeEventListener('cancel', handleCancel);
+    };
+  });
+
+  function clearFileDialogTimer(ref: { current: number | undefined }) {
+    if (ref.current === undefined) return;
+    window.clearTimeout(ref.current);
+    ref.current = undefined;
+  }
+
+  function prepareFileDialogTracking() {
+    if (!directory || !onProcessingStart) return;
+    const previousFinish = completeFileDialogTracking();
+    previousFinish?.();
+    fileDialogPendingRef.current = true;
+    fileDialogCanShowLoadingRef.current = false;
+    fileDialogFocusDelayRef.current = window.setTimeout(() => {
+      fileDialogCanShowLoadingRef.current = true;
+      fileDialogFocusDelayRef.current = undefined;
+    }, SOURCE_FILE_DIALOG_FOCUS_DELAY_MS);
+    fileDialogWarmupRef.current = window.setTimeout(() => {
+      fileDialogCanShowLoadingRef.current = true;
+      fileDialogWarmupRef.current = undefined;
+      beginFileDialogReturnLoading();
+    }, SOURCE_FILE_DIALOG_WARMUP_MS);
+  }
+
+  function beginFileDialogReturnLoading() {
+    if (!fileDialogPendingRef.current) return;
+    if (!fileDialogCanShowLoadingRef.current) return;
+    if (!onProcessingStart) return;
+    if (fileDialogLoadingFinishRef.current) return;
+    fileDialogLoadingFinishRef.current = onProcessingStart();
+    fileDialogStaleRef.current = window.setTimeout(() => {
+      const finish = completeFileDialogTracking();
+      finishProcessingLater(finish);
+    }, SOURCE_FILE_DIALOG_STALE_MS);
+  }
+
+  function completeFileDialogTracking() {
+    clearFileDialogTimer(fileDialogFocusDelayRef);
+    clearFileDialogTimer(fileDialogWarmupRef);
+    clearFileDialogTimer(fileDialogStaleRef);
+    fileDialogPendingRef.current = false;
+    fileDialogCanShowLoadingRef.current = false;
+    const finish = fileDialogLoadingFinishRef.current;
+    fileDialogLoadingFinishRef.current = undefined;
+    return finish;
+  }
+
+  function finishProcessingLater(finish: (() => void) | undefined) {
+    if (!finish) return;
+    window.setTimeout(finish, SOURCE_PROCESSING_MIN_VISIBLE_MS);
+  }
+  function shouldShowProcessing(files: File[]) {
+    if (files.length >= SOURCE_PROCESSING_LOADING_FILE_COUNT) return true;
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    return totalBytes >= SOURCE_PROCESSING_LOADING_BYTES;
+  }
+  function stageFiles(nextFiles: File[]) {
     const nextNames = nextFiles.map((file) => localCodeRelativePath(file));
-    if (nextNames.length > 0) onFiles(nextNames, nextFiles);
+    if (nextNames.length > 0) {
+      onError?.(null);
+      onFiles(nextNames, nextFiles);
+    }
+  }
+  function processSelectedFiles(nextFiles: File[], activeFinish?: () => void) {
+    if (nextFiles.length === 0) {
+      finishProcessingLater(activeFinish);
+      return;
+    }
+    if (!shouldShowProcessing(nextFiles) || !onProcessingStart) {
+      stageFiles(nextFiles);
+      finishProcessingLater(activeFinish);
+      return;
+    }
+    const finish = activeFinish ?? onProcessingStart();
+    runAfterNextPaint(() => {
+      try {
+        stageFiles(nextFiles);
+      } finally {
+        finishProcessingLater(finish);
+      }
+    });
+  }
+  function readFiles(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.currentTarget.files ?? []);
+    event.currentTarget.value = '';
+    const finish = completeFileDialogTracking();
+    processSelectedFiles(files, finish);
   }
   async function readDrop(dataTransfer: DataTransfer) {
-    const nextFiles = await filesFromDataTransfer(dataTransfer);
-    readFiles(nextFiles);
+    onError?.(null);
+    try {
+      const nextFiles = await filesFromDataTransfer(dataTransfer);
+      processSelectedFiles(nextFiles);
+    } catch (error) {
+      if (!isFileSystemReadError(error)) throw error;
+      onError?.(FILE_SYSTEM_READ_ERROR_MESSAGE);
+    }
   }
   const directoryProps = directory ? ({ webkitdirectory: '', directory: '' } as Record<string, string>) : {};
 
@@ -2500,19 +2720,21 @@ function DropZone({
           }}
         >
           <input
+            ref={inputRef}
             className="ds-hidden-input"
             type="file"
             multiple
             accept={accept}
-            onChange={(event) => readFiles(event.target.files)}
+            onClick={prepareFileDialogTracking}
+            onChange={readFiles}
             {...directoryProps}
           />
           <span>{names.length > 0 && !onRemoveName ? names.join(', ') : prompt}</span>
         </label>
         {onBrowseFolder ? (
-          <button type="button" className="ghost" onClick={onBrowseFolder}>
+          <Button variant="ghost" onClick={onBrowseFolder}>
             Browse folder
-          </button>
+          </Button>
         ) : null}
       </div>
       {names.length > 0 && onRemoveName ? (
@@ -2532,18 +2754,33 @@ function DropZone({
   );
 }
 
+function runAfterNextPaint(callback: () => void) {
+  if (typeof window.requestAnimationFrame === 'function') {
+    window.requestAnimationFrame(() => window.setTimeout(callback, 0));
+    return;
+  }
+  window.setTimeout(callback, 0);
+}
+
 async function filesFromDataTransfer(dataTransfer: DataTransfer): Promise<File[]> {
+  const fallbackFiles = Array.from(dataTransfer.files ?? []);
   const items = Array.from(dataTransfer.items ?? []);
+  if (items.length === 0) return fallbackFiles;
   const entries = items
     .map((item) => {
       const getter = (item as { webkitGetAsEntry?: () => unknown }).webkitGetAsEntry;
       return getter?.call(item) ?? null;
     })
     .filter(isWebkitFileSystemEntry);
-  if (entries.length === 0) return Array.from(dataTransfer.files ?? []);
-  const droppedFiles = await Promise.all(entries.map((entry) => filesFromEntry(entry, entry.name)));
-  const flattened = droppedFiles.flat();
-  return flattened.length > 0 ? flattened : Array.from(dataTransfer.files ?? []);
+  if (entries.length === 0) return fallbackFiles;
+  const results = await Promise.allSettled(entries.map((entry) => filesFromEntry(entry, entry.name)));
+  const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (rejected) {
+    if (fallbackFiles.length > 0) return fallbackFiles;
+    throw rejected.reason;
+  }
+  const droppedFiles = results.flatMap((result) => (result.status === 'fulfilled' ? result.value : []));
+  return droppedFiles.length > 0 ? droppedFiles : fallbackFiles;
 }
 
 function isWebkitFileSystemEntry(entry: unknown): entry is WebkitFileSystemEntry {
@@ -2571,7 +2808,9 @@ async function filesFromEntry(entry: WebkitFileSystemEntry, relativePath: string
 
 function fileFromEntry(entry: WebkitFileSystemFileEntry): Promise<File> {
   return new Promise((resolve, reject) => {
-    entry.file(resolve, reject);
+    entry.file(resolve, (error) => {
+      reject(createFileSystemReadError('Could not read dropped file', error));
+    });
   });
 }
 
@@ -2587,7 +2826,9 @@ function readAllDirectoryEntries(entry: WebkitFileSystemDirectoryEntry): Promise
         }
         entries.push(...batch);
         readNextBatch();
-      }, reject);
+      }, (error) => {
+        reject(createFileSystemReadError('Could not read dropped folder', error));
+      });
     }
     readNextBatch();
   });
@@ -2680,24 +2921,24 @@ function GitHubRepositoryAccessPanel({
   }
 
   const composioAction = !composioConfigured ? (
-    <button type="button" className="ghost" onClick={onOpenConnectorsTab}>
+    <Button variant="ghost" onClick={onOpenConnectorsTab}>
       Configure Composio
-    </button>
+    </Button>
   ) : connected || authorizationPending ? (
     <>
       {authorizationPending && authorizationUrl ? (
-        <button type="button" className="ghost" disabled={busy} onClick={onOpenAuthorization}>
+        <Button variant="ghost" disabled={busy} onClick={onOpenAuthorization}>
           Open authorization
-        </button>
+        </Button>
       ) : null}
-      <button type="button" className="ghost" disabled={busy} onClick={onDisconnect}>
+      <Button variant="ghost" disabled={busy} onClick={onDisconnect}>
         {action === 'disconnect' ? 'Disconnecting...' : 'Disconnect'}
-      </button>
+      </Button>
     </>
   ) : (
-    <button type="button" className="ghost" disabled={busy} onClick={onConnect}>
+    <Button variant="ghost" disabled={busy} onClick={onConnect}>
       {action === 'connect' ? 'Connecting...' : 'Connect via Composio'}
-    </button>
+    </Button>
   );
 
   const methods: GitHubAccessMethod[] = [
