@@ -29,14 +29,12 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY scripts/postinstall.mjs ./scripts/postinstall.mjs
 COPY packages ./packages
 COPY tools ./tools
-COPY apps/daemon/package.json ./apps/daemon/package.json
-COPY apps/web/package.json ./apps/web/package.json
+COPY apps ./apps
 COPY e2e/package.json ./e2e/package.json
 RUN corepack enable && \
     corepack prepare pnpm@10.33.2 --activate && \
     NODE_OPTIONS=${OD_BUILD_NODE_OPTIONS} pnpm install --frozen-lockfile
 
-COPY apps ./apps
 RUN NODE_OPTIONS=${OD_BUILD_NODE_OPTIONS} pnpm --filter @open-design/daemon build && \
     NODE_OPTIONS=${OD_BUILD_NODE_OPTIONS} pnpm --filter @open-design/web build && \
     NODE_OPTIONS=${OD_BUILD_NODE_OPTIONS} pnpm --filter @open-design/daemon deploy --legacy --prod /app/deploy/daemon && \
@@ -112,7 +110,7 @@ WORKDIR /app
 
 COPY --from=build --chown=node:node /app/deploy/daemon ./apps/daemon
 COPY --from=build --chown=node:node /app/apps/web/out ./apps/web/out
-COPY --from=build --chown=node:node /app/apps/skills ./skills
+COPY --from=build --chown=node:node /app/skills ./skills
 COPY --from=build --chown=node:node /app/design-systems ./design-systems
 COPY --from=build --chown=node:node /app/craft ./craft
 COPY --from=build --chown=node:node /app/prompt-templates ./prompt-templates
